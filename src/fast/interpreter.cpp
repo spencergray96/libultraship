@@ -28,6 +28,7 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/PerfCounters.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -135,7 +136,10 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 void Interpreter::Flush() {
+    gPerfCounters.flushes++;
     if (mBufVboLen > 0) {
+        gPerfCounters.draws++;
+        gPerfCounters.tris += mBufVboNumTris;
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
@@ -5139,6 +5143,10 @@ void Interpreter::RunGuiOnly() {
 }
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
+    // One Run call is one rendered frame: everything from here to the closing brace is the
+    // display-list walk and the draws it submits, which is what the render-side counters report.
+    PerfCountersFrameScope perfFrame;
+
     SpReset();
 
     mGetPixelDepthPending.clear();
