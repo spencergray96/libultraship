@@ -977,10 +977,18 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
         return nullptr;
     }
 
-    BuildShaderProgram(prg, source, cc_features, base->shader_id0, base->shader_id1, numFloats);
-    // BuildShaderProgram throws on a compile failure rather than returning, so reaching here means
-    // the twin is complete. Its input layout came from the same cc_features as the original, so
-    // the recorded vertex stream still parses byte for byte.
+    // BuildShaderProgram signals a compile failure by throwing, and this runs from inside the render
+    // loop - letting it escape would crash rather than degrade. The contract here is no-bake, never
+    // wrong pixels, so a patched stage that will not compile just drops back to interpreted.
+    try {
+        BuildShaderProgram(prg, source, cc_features, base->shader_id0, base->shader_id1, numFloats);
+    } catch (...) {
+        SPDLOG_ERROR("[staticbake] patched shader failed to compile; shader {:#x}/{:#x} will stay interpreted",
+                     base->shader_id0, base->shader_id1);
+        return nullptr;
+    }
+    // Reaching here means the twin is complete. Its input layout came from the same cc_features as
+    // the original, so the recorded vertex stream still parses byte for byte.
     return prg;
 }
 

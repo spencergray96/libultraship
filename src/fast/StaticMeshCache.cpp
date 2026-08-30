@@ -355,6 +355,10 @@ void StaticBakeReset() {
 void StaticBakeInvalidateAll() {
     for (auto& kv : sEntries) {
         if (kv.second.state == BakeState::Baked) {
+            // Drop the GPU buffer first: the re-record's FinishRecording overwrites e->buffer with a
+            // fresh CreateStaticBuffer handle, so skipping this leaks one buffer per baked room per
+            // ShaderCacheClear (which a graphics-settings change triggers).
+            ReleaseGpu(kv.second);
             kv.second.state = BakeState::Unbaked;
         }
     }
