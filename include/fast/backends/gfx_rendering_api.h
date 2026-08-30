@@ -16,6 +16,31 @@ struct GfxClipParameters {
 
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
 
+// Face culling for a baked draw. The interpreter culls per triangle on the CPU, in clip space,
+// which a recording cannot do: at record time the vertices are in object space and there is no
+// camera to be facing away from. The recorded draw therefore carries the RSP's cull mode and the
+// backend asks the rasterizer for it instead - the same decision, one stage later.
+enum StaticBakeCull : uint8_t {
+    STATIC_BAKE_CULL_NONE = 0,
+    STATIC_BAKE_CULL_FRONT,
+    STATIC_BAKE_CULL_BACK,
+    STATIC_BAKE_CULL_BOTH, // recording-side only: GfxSpTri1 drops these, so the bake is refused
+};
+
+// Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the
+// vertex payload by the CPU. See fast/StaticMeshCache.h. Laid out to be memcpy'd straight into a
+// 16-byte-aligned constant buffer.
+struct StaticBakeUniforms {
+    // Camera * projection as the interpreter would have applied it, with the widescreen X
+    // adjustment folded in. Row-major, i.e. the same memory order as RSP::MP_matrix, so
+    // clip = mul(float4(objectPos, 1), mvp) in HLSL.
+    float mvp[4][4];
+    float fogColor[4];
+    float fogMul;    // RSP fog_mul, as G_MW_FOG left it
+    float fogOffset; // RSP fog_offset
+    float pad[2];    // constant buffers are multiples of 16 bytes
+};
+
 // A hash function used to hash a: pair<float, float>
 struct hash_pair_ff {
     size_t operator()(const std::pair<float, float>& p) const {
@@ -79,6 +104,37 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+
+    // ---- Static-geometry bake (sturdy-bassoon#40). ----
+    // Defaults are no-ops so a backend that has not implemented the path still compiles and
+    // simply never bakes: StaticBakeIntercept refuses to record when SupportsStaticBake() is
+    // false, and every display list stays interpreted. DX11 is the only implementation today.
+    virtual bool SupportsStaticBake() {
+        return false;
+    }
+    // Upload an immutable vertex buffer. Returns 0 on failure; ids are otherwise opaque.
+    virtual uint32_t CreateStaticBuffer(const void* data, size_t sizeBytes) {
+        return 0;
+    }
+    virtual void DeleteStaticBuffer(uint32_t bufferId) {
+    }
+    // Build (or find) the transform-enabled twin of an already-created shader program. Returning
+    // false rejects the bake rather than drawing something wrong.
+    virtual bool PrepareStaticShader(struct ShaderProgram* prg) {
+        return false;
+    }
+    // Floats per vertex the given program's input layout expects - used to cross-check the stride
+    // the recording actually produced before anything is drawn with it.
+    virtual uint8_t GetShaderNumFloats(struct ShaderProgram* prg) {
+        return 0;
+    }
+    // One replayed draw. The caller has already applied depth/decal state through the normal
+    // setters; this binds the persistent buffer, the transform-enabled shader and the uniforms,
+    // draws, and leaves the backend's "currently bound" memo invalidated so the next interpreted
+    // draw rebinds from scratch.
+    virtual void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
+                                     const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) {
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

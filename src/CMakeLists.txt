@@ -143,6 +143,12 @@ endif()
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})
 
+# Static-geometry bake prototype (sturdy-bassoon#40 Stage 1) - see src/fast/StaticMeshCache.cpp.
+# The feature is additionally gated at runtime by the host (SOH_STATIC_BAKE=1); with the env var
+# unset nothing is ever registered and the interpreter takes its normal path. PUBLIC so the host
+# can compile its registration side against the same flag.
+target_compile_definitions(libultraship PUBLIC ENABLE_STATIC_BAKE)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         WIN32

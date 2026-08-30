@@ -27,8 +27,12 @@ struct PerfCounters {
                        // which there are typically several rendered frames each.
     double interpMs;   // summed wall time spent inside Interpreter::Run
     uint64_t flushes;  // Interpreter::Flush calls, including those with nothing buffered
-    uint64_t draws;    // flushes that issued geometry: one DrawTriangles, i.e. one GPU draw call
-    uint64_t tris;     // triangles submitted through those draws
+    uint64_t draws;      // GPU draw calls: flushes that issued geometry, plus replayed baked draws
+    uint64_t tris;       // triangles submitted through the *interpreted* draws
+    uint64_t drawsBaked; // the subset of draws that replayed a baked static mesh (#40 Stage 1)
+    uint64_t trisBaked;  // triangles those replays drew. Deliberately not folded into tris: baked
+                         // geometry never reaches GfxSpTri1, so it is neither CPU-culled nor
+                         // counted there, and adding the two would compare unlike numbers
 
     // The most recently completed rendered frame on its own, published by PerfCountersEndFrame.
     // A fixed viewpoint makes these stable frame to frame, so lastTris is directly comparable to
@@ -37,6 +41,8 @@ struct PerfCounters {
     uint64_t lastFlushes;
     uint64_t lastDraws;
     uint64_t lastTris;
+    uint64_t lastDrawsBaked;
+    uint64_t lastTrisBaked;
 };
 
 // The live block. The hot path increments it directly so a flush costs an add rather than a

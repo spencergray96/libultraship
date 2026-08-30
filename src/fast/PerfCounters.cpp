@@ -18,6 +18,8 @@ std::chrono::steady_clock::time_point sFrameStart;
 uint64_t sFrameStartFlushes = 0;
 uint64_t sFrameStartDraws = 0;
 uint64_t sFrameStartTris = 0;
+uint64_t sFrameStartDrawsBaked = 0;
+uint64_t sFrameStartTrisBaked = 0;
 bool sFrameOpen = false;
 } // namespace
 
@@ -25,6 +27,8 @@ void PerfCountersBeginFrame() {
     sFrameStartFlushes = gPerfCounters.flushes;
     sFrameStartDraws = gPerfCounters.draws;
     sFrameStartTris = gPerfCounters.tris;
+    sFrameStartDrawsBaked = gPerfCounters.drawsBaked;
+    sFrameStartTrisBaked = gPerfCounters.trisBaked;
     sFrameOpen = true;
     sFrameStart = std::chrono::steady_clock::now();
 }
@@ -42,6 +46,8 @@ void PerfCountersEndFrame() {
     gPerfCounters.lastFlushes = gPerfCounters.flushes - sFrameStartFlushes;
     gPerfCounters.lastDraws = gPerfCounters.draws - sFrameStartDraws;
     gPerfCounters.lastTris = gPerfCounters.tris - sFrameStartTris;
+    gPerfCounters.lastDrawsBaked = gPerfCounters.drawsBaked - sFrameStartDrawsBaked;
+    gPerfCounters.lastTrisBaked = gPerfCounters.trisBaked - sFrameStartTrisBaked;
 
     gPerfCounters.interpMs += ms;
     gPerfCounters.frames++;

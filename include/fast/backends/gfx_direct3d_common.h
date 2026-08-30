@@ -32,6 +32,12 @@ struct PerPrimDepthCB {
     float _pad[3]; // 16-byte CB alignment
 };
 
+// Vertex-stage constant buffer for baked draws (fast/StaticMeshCache.h). Bound at b3 because
+// b0-b2 are already spoken for by the pixel-stage buffers above, and HLSL will not accept two
+// cbuffers on the same register in one translation unit even when different entry points use
+// them. Nothing but the baked vertex shader ever reads it.
+constexpr uint32_t STATIC_BAKE_CB_SLOT = 3;
+
 struct Coord {
     int x, y;
 };
@@ -119,6 +125,14 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    bool SupportsStaticBake() override;
+    uint32_t CreateStaticBuffer(const void* data, size_t sizeBytes) override;
+    void DeleteStaticBuffer(uint32_t bufferId) override;
+    bool PrepareStaticShader(struct ShaderProgram* prg) override;
+    uint8_t GetShaderNumFloats(struct ShaderProgram* prg) override;
+    void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
+                             const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) override;
+
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
     Microsoft::WRL::ComPtr<ID3D11Device> mDevice;
@@ -128,6 +142,21 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
+    // Shared by the interpreted and baked shader paths: compile one generated HLSL source into a
+    // ShaderProgramD3D11 (vertex + pixel shader, input layout, blend state).
+    void BuildShaderProgram(struct ShaderProgramD3D11* prg, const std::string& source, const CCFeatures& cc_features,
+                            uint64_t shader_id0, uint64_t shader_id1, size_t numFloats);
+    // Depth-stencil and rasterizer state, applied lazily from mCurrent*/mLast*. Factored out of
+    // DrawTriangles so a baked draw goes through exactly the same state transitions.
+    void ApplyDepthAndRasterState();
+    // Build the rasterizer description the interpreted path uses, for a given decal mode.
+    D3D11_RASTERIZER_DESC MakeRasterizerDesc(bool zmodeDecal);
+    // Bind a rasterizer that culls the way the RSP asked, for one baked draw. Invalidates the
+    // interpreted path's rasterizer memo so it rebinds its own (cull-none) state afterwards.
+    void ApplyStaticRasterState(uint8_t cullMode, bool zmodeDecal);
+    // The transform-enabled twin of a program, compiled on first use. Null if the generated HLSL
+    // did not carry the markers the patch needs (see StaticBakePatchSource).
+    struct ShaderProgramD3D11* LookupOrCreateStaticShader(struct ShaderProgramD3D11* base);
 
     HMODULE mDX11Module;
 
@@ -161,6 +190,16 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerPrimDepthCB mPerPrimDepthCbData;
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
+    // Transform-enabled twins, same keys. A separate pool so LookupShader() can never hand the
+    // interpreter a baked program by accident. std::map nodes are address-stable, which is what
+    // lets StaticMeshCache hold raw ShaderProgram* across further insertions.
+    std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mStaticShaderPool;
+    // Persistent vertex buffers for baked meshes. Index 0 is never handed out (0 means failure).
+    std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> mStaticBuffers;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeCb;
+    // Rasterizer states for baked draws, indexed cullMode * 2 + zmodeDecal. Built on demand and
+    // kept, because a baked draw binds one every frame.
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mStaticRasterizers[6];
 
     std::vector<struct TextureData> mTextures;
     int mCurrentTile;

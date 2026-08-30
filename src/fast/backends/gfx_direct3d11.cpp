@@ -1,6 +1,8 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 #include <cmath>
 
@@ -385,20 +387,37 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
 
 void GfxRenderingAPIDX11::ClearShaderCache() {
     mShaderProgramPool.clear();
+    // The baked twins are keyed off the same shader ids and are worthless without them. Anything
+    // holding a ShaderProgram* across this (StaticMeshCache does) is invalidated by the
+    // interpreter side of ShaderCacheClear.
+    mStaticShaderPool.clear();
+    mLastShaderProgram = nullptr;
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
-    char* buf;
-    size_t len, numFloats;
+    size_t numFloats;
 
     auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
                                                    mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
 
-    buf = shader.data();
-    len = shader.size();
+    struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
+    BuildShaderProgram(prg, shader, cc_features, shader_id0, shader_id1, numFloats);
+
+    return (struct ShaderProgram*)(mShaderProgram = prg);
+}
+
+// Compile one generated HLSL source into a program. Split out of CreateAndLoadNewShader so the
+// static-bake path can reuse every step for its patched twin - in particular the input layout,
+// which must stay byte-identical to the interpreted one or a baked draw reads the vertex stream
+// wrong.
+void GfxRenderingAPIDX11::BuildShaderProgram(struct ShaderProgramD3D11* prg, const std::string& source,
+                                             const CCFeatures& cc_features, uint64_t shader_id0, uint64_t shader_id1,
+                                             size_t numFloats) {
+    const char* buf = source.data();
+    size_t len = source.size();
 
     ComPtr<ID3DBlob> vs, ps;
     ComPtr<ID3DBlob> error_blob;
@@ -426,8 +445,6 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw Ship::HResultException(hr, "Pixel shader compilation failed");
     }
-
-    struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
 
     ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
                                               prg->vertex_shader.GetAddressOf()));
@@ -515,15 +532,13 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->shader_id0 = shader_id0;
     prg->shader_id1 = shader_id1;
     prg->numInputs = cc_features.numInputs;
-    prg->numFloats = numFloats;
+    prg->numFloats = (uint8_t)numFloats;
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
     prg->usedTextures[2] = cc_features.used_masks[0];
     prg->usedTextures[3] = cc_features.used_masks[1];
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
-
-    return (struct ShaderProgram*)(mShaderProgram = prg);
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
@@ -667,8 +682,11 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
     // Already part of the pipeline state from shader info
 }
 
-void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-
+// Depth-stencil and rasterizer state, rebuilt only when the requested state actually moved.
+// Shared by the interpreted and the baked draw paths so both go through identical transitions -
+// a baked draw that set state some other way would leave the memo lying to the next interpreted
+// one.
+void GfxRenderingAPIDX11::ApplyDepthAndRasterState() {
     if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
@@ -694,41 +712,88 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mLastZmodeDecal = mCurrentZmodeDecal;
 
         mRasterizerState.Reset();
-
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
-
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
-
-        switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
-        }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
-
+        D3D11_RASTERIZER_DESC rasterizer_desc = MakeRasterizerDesc(mCurrentZmodeDecal != 0);
         ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
         mContext->RSSetState(mRasterizerState.Get());
     }
+}
+
+// The interpreted path's rasterizer description. Culling is left to the CPU (GfxSpTri1 rejects
+// backfacing triangles before they are ever buffered), so this is always CULL_NONE; the baked path
+// overrides just that field.
+D3D11_RASTERIZER_DESC GfxRenderingAPIDX11::MakeRasterizerDesc(bool zmodeDecal) {
+    D3D11_RASTERIZER_DESC rasterizer_desc;
+    ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+
+    rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+    rasterizer_desc.CullMode = D3D11_CULL_NONE;
+    rasterizer_desc.FrontCounterClockwise = true;
+    rasterizer_desc.DepthBias = 0;
+    // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+    // fighting
+    const int n64modeFactor = 120;
+    const int noVanishFactor = 100;
+    float SSDB = -2;
+
+    switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
+        case 1: // scaled z-fighting (N64 mode like)
+            SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+            break;
+        case 2: // no vanishing paths
+            SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+            break;
+        case 0: // disabled
+        default:
+            SSDB = -2;
+    }
+    rasterizer_desc.SlopeScaledDepthBias = zmodeDecal ? SSDB : 0.0f;
+    rasterizer_desc.DepthBiasClamp = 0.0f;
+    rasterizer_desc.DepthClipEnable = false;
+    rasterizer_desc.ScissorEnable = true;
+    rasterizer_desc.MultisampleEnable = false;
+    rasterizer_desc.AntialiasedLineEnable = false;
+    return rasterizer_desc;
+}
+
+// Cull for a baked draw the way GfxSpTri1 would have.
+//
+// The mapping is direct - G_CULL_BACK to D3D11_CULL_BACK, G_CULL_FRONT to D3D11_CULL_FRONT - and
+// it is *not* what following the winding through on paper predicts. That reasoning
+// (GfxSpTri1 keeps counter-clockwise-in-Y-up for G_CULL_BACK; the viewport flips Y; with
+// FrontCounterClockwise = true a clockwise-on-screen triangle is a back face; therefore
+// G_CULL_BACK should map to CULL_FRONT) leaves out a second handedness flip - the game's own
+// projection matrix, which is built to the N64's convention rather than D3D's. The two flips
+// cancel. Verified against the fixtures rather than argued: with the mapping inverted the test
+// level renders its floor away and its outward-facing boundary wall in, which is the exact
+// signature to look for if this is ever touched again.
+void GfxRenderingAPIDX11::ApplyStaticRasterState(uint8_t cullMode, bool zmodeDecal) {
+    const uint32_t slot = (uint32_t)cullMode * 2u + (zmodeDecal ? 1u : 0u);
+    if (slot >= 6) {
+        return;
+    }
+    if (!mStaticRasterizers[slot]) {
+        D3D11_RASTERIZER_DESC desc = MakeRasterizerDesc(zmodeDecal);
+        switch (cullMode) {
+            case STATIC_BAKE_CULL_FRONT:
+                desc.CullMode = D3D11_CULL_FRONT;
+                break;
+            case STATIC_BAKE_CULL_BACK:
+                desc.CullMode = D3D11_CULL_BACK;
+                break;
+            default:
+                desc.CullMode = D3D11_CULL_NONE;
+                break;
+        }
+        ThrowIfFailed(mDevice->CreateRasterizerState(&desc, mStaticRasterizers[slot].GetAddressOf()));
+    }
+    mContext->RSSetState(mStaticRasterizers[slot].Get());
+    // The interpreted path believes its own CULL_NONE state is still bound. Make it rebind.
+    mLastZmodeDecal = -1;
+}
+
+void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+
+    ApplyDepthAndRasterState();
 
     bool textures_changed = false;
 
@@ -813,6 +878,230 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     }
 
     mContext->Draw(buf_vbo_num_tris * 3, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Static-geometry bake (fast/StaticMeshCache.h)
+// ---------------------------------------------------------------------------
+
+// Turn a generated shader into its transform-enabled twin by patching the two lines the vertex
+// stage would otherwise pass straight through.
+//
+// This is a textual splice on the prism output rather than a new option in
+// shaders/directx/default.shader.hlsl on purpose: that template is loaded from soh.o2r at
+// runtime, so editing it means regenerating and redistributing the archive alongside the exe -
+// a much bigger moving part than a prototype wants. Both markers are asserted rather than
+// assumed; if either is missing the caller rejects the bake and the display list stays
+// interpreted, so a template change degrades to "no speedup" and never to "wrong pixels".
+//
+// What the patched vertex stage does that the original did not:
+//   * multiplies the (now object-space) position by the camera, and applies the DX11 0..1 depth
+//     remap that GfxSpTri1 used to do per vertex on the CPU;
+//   * recomputes the fog factor from the *unremapped* clip z/w with the same clamp and the same
+//     division-by-zero guard as GfxSpVertex, and takes the fog colour from the uniform - the
+//     recorded fog bytes are dead weight (the record pass saw an identity matrix), which is why
+//     fog changes need no rebake.
+static bool StaticBakePatchSource(std::string& src, bool hasFog) {
+    static const char* kPosMarker = "result.position = position;";
+    static const char* kFogMarker = "result.fog = fog;";
+
+    const size_t posAt = src.find(kPosMarker);
+    if (posAt == std::string::npos) {
+        return false;
+    }
+    if (hasFog && src.find(kFogMarker) == std::string::npos) {
+        return false;
+    }
+
+    const size_t vsAt = src.find("PSInput VSMain(");
+    if (vsAt == std::string::npos) {
+        return false;
+    }
+
+    std::string cb = "cbuffer StaticBakeCB : register(b";
+    cb += std::to_string(STATIC_BAKE_CB_SLOT);
+    cb += ") {\n"
+          "    row_major float4x4 uMVP;\n"
+          "    float4 uFogColor;\n"
+          "    float4 uFogParams;\n" // x = fog_mul, y = fog_offset
+          "};\n\n";
+    src.insert(vsAt, cb);
+
+    std::string posCode = "float4 bakeClip = mul(float4(position.xyz, 1.0), uMVP);\n"
+                          "    result.position = float4(bakeClip.x, bakeClip.y, "
+                          "(bakeClip.z + bakeClip.w) * 0.5, bakeClip.w);";
+    const size_t posAt2 = src.find(kPosMarker);
+    src.replace(posAt2, strlen(kPosMarker), posCode);
+
+    if (hasFog) {
+        // Mirrors GfxSpVertex exactly, including the division-by-zero guard, the 0..255 clamp and
+        // the floor: the interpreter stores the factor in a uint8_t colour channel, so the
+        // quantization is part of the picture, not an artefact of it.
+        std::string fogCode = "float bakeW = abs(bakeClip.w) < 0.001 ? 0.001 : bakeClip.w;\n"
+                              "        float bakeWinv = 1.0 / bakeW;\n"
+                              "        if (bakeWinv < 0.0) { bakeWinv = 32767.0; }\n"
+                              "        float bakeFog = floor(clamp(bakeClip.z * bakeWinv * uFogParams.x + "
+                              "uFogParams.y, 0.0, 255.0)) / 255.0;\n"
+                              "        result.fog = float4(uFogColor.rgb, bakeFog);";
+        const size_t fogAt = src.find(kFogMarker);
+        src.replace(fogAt, strlen(kFogMarker), fogCode);
+    }
+    return true;
+}
+
+struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struct ShaderProgramD3D11* base) {
+    const auto key = std::make_pair(base->shader_id0, (uint32_t)base->shader_id1);
+    auto it = mStaticShaderPool.find(key);
+    if (it != mStaticShaderPool.end()) {
+        // A failed compile leaves a program with no vertex shader; remember that rather than
+        // retrying (and re-messageboxing) on every frame.
+        return it->second.vertex_shader ? &it->second : nullptr;
+    }
+
+    CCFeatures cc_features;
+    gfx_cc_get_features(base->shader_id0, base->shader_id1, &cc_features);
+
+    size_t numFloats;
+    std::string source = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
+                                                          mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+
+    struct ShaderProgramD3D11* prg = &mStaticShaderPool[key];
+    if (!StaticBakePatchSource(source, cc_features.opt_fog)) {
+        // Dump the vertex stage as generated, so a template change that moves the markers is one
+        // log read to diagnose rather than a rebuild.
+        const size_t at = source.find("VSMain");
+        SPDLOG_ERROR("[staticbake] generated HLSL did not carry the expected vertex-stage markers; "
+                     "shader {:#x}/{:#x} will stay interpreted. Vertex stage as generated:\n{}",
+                     base->shader_id0, base->shader_id1,
+                     at == std::string::npos ? source.substr(0, 600) : source.substr(at, 900));
+        return nullptr;
+    }
+
+    BuildShaderProgram(prg, source, cc_features, base->shader_id0, base->shader_id1, numFloats);
+    // BuildShaderProgram throws on a compile failure rather than returning, so reaching here means
+    // the twin is complete. Its input layout came from the same cc_features as the original, so
+    // the recorded vertex stream still parses byte for byte.
+    return prg;
+}
+
+bool GfxRenderingAPIDX11::SupportsStaticBake() {
+    // The recorded payload keeps the interpreter's own clip conventions, and the patched vertex
+    // shader hard-codes the matching ones. GetClipParameters() is a compile-time constant for this
+    // backend ({ z 0..1, no Y flip }); assert it rather than trusting the comment.
+    const GfxClipParameters clip = GetClipParameters();
+    return clip.z_is_from_0_to_1 && !clip.invertY;
+}
+
+uint32_t GfxRenderingAPIDX11::CreateStaticBuffer(const void* data, size_t sizeBytes) {
+    if (data == nullptr || sizeBytes == 0) {
+        return 0;
+    }
+
+    D3D11_BUFFER_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.ByteWidth = (UINT)sizeBytes;
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA init;
+    ZeroMemory(&init, sizeof(init));
+    init.pSysMem = data;
+
+    ComPtr<ID3D11Buffer> buffer;
+    if (FAILED(mDevice->CreateBuffer(&desc, &init, buffer.GetAddressOf()))) {
+        SPDLOG_ERROR("[staticbake] failed to create a {} byte static vertex buffer", sizeBytes);
+        return 0;
+    }
+
+    if (mStaticBuffers.empty()) {
+        mStaticBuffers.emplace_back(nullptr); // id 0 is reserved for "no buffer"
+    }
+    // Reuse a slot freed by DeleteStaticBuffer before growing: a scene change frees every buffer,
+    // so without this the vector would grow by one room per load for the life of the process.
+    for (size_t i = 1; i < mStaticBuffers.size(); i++) {
+        if (!mStaticBuffers[i]) {
+            mStaticBuffers[i] = buffer;
+            return (uint32_t)i;
+        }
+    }
+    mStaticBuffers.emplace_back(buffer);
+    return (uint32_t)(mStaticBuffers.size() - 1);
+}
+
+void GfxRenderingAPIDX11::DeleteStaticBuffer(uint32_t bufferId) {
+    if (bufferId != 0 && bufferId < mStaticBuffers.size()) {
+        mStaticBuffers[bufferId].Reset();
+    }
+}
+
+bool GfxRenderingAPIDX11::PrepareStaticShader(struct ShaderProgram* prg) {
+    if (prg == nullptr) {
+        return false;
+    }
+    return LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg) != nullptr;
+}
+
+uint8_t GfxRenderingAPIDX11::GetShaderNumFloats(struct ShaderProgram* prg) {
+    return prg == nullptr ? 0 : ((struct ShaderProgramD3D11*)prg)->numFloats;
+}
+
+void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris,
+                                              struct ShaderProgram* prg, const StaticBakeUniforms& uniforms,
+                                              uint8_t cullMode, bool zmodeDecal) {
+    if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || numTris == 0) {
+        return;
+    }
+    struct ShaderProgramD3D11* variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg);
+    if (variant == nullptr) {
+        return;
+    }
+
+    ApplyDepthAndRasterState();
+    ApplyStaticRasterState(cullMode, zmodeDecal);
+
+    if (!mStaticBakeCb) {
+        D3D11_BUFFER_DESC desc;
+        ZeroMemory(&desc, sizeof(desc));
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.ByteWidth = sizeof(StaticBakeUniforms);
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(mDevice->CreateBuffer(&desc, nullptr, mStaticBakeCb.GetAddressOf()))) {
+            SPDLOG_ERROR("[staticbake] failed to create the vertex-stage constant buffer");
+            return;
+        }
+    }
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(ms));
+    mContext->Map(mStaticBakeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    memcpy(ms.pData, &uniforms, sizeof(StaticBakeUniforms));
+    mContext->Unmap(mStaticBakeCb.Get(), 0);
+    mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 1, mStaticBakeCb.GetAddressOf());
+
+    const uint32_t stride = variant->numFloats * sizeof(float);
+    const uint32_t offset = (uint32_t)byteOffset;
+    mContext->IASetVertexBuffers(0, 1, mStaticBuffers[bufferId].GetAddressOf(), &stride, &offset);
+    mContext->IASetInputLayout(variant->input_layout.Get());
+    mContext->VSSetShader(variant->vertex_shader.Get(), 0, 0);
+    mContext->PSSetShader(variant->pixel_shader.Get(), 0, 0);
+    mContext->OMSetBlendState(variant->blend_state.Get(), 0, 0xFFFFFFFF);
+
+    if (mLastPrimitaveTopology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
+        mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
+
+    mContext->Draw((UINT)(numTris * 3), 0);
+
+    // Everything this draw bound behind the interpreted path's back has to be forgotten, or the
+    // next interpreted DrawTriangles will skip a rebind it actually needs and read the wrong
+    // buffer through the wrong shader. Stride 0 is not a legal stride, so it reads as "unknown".
+    mLastVertexBufferStride = 0;
+    mLastShaderProgram = nullptr;
+    mLastBlendState.Reset();
 }
 
 void GfxRenderingAPIDX11::OnResize() {

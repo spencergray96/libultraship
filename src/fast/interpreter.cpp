@@ -29,6 +29,7 @@
 
 #include "fast/interpreter.h"
 #include "fast/PerfCounters.h"
+#include "fast/StaticMeshCache.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -138,6 +139,17 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 void Interpreter::Flush() {
     gPerfCounters.flushes++;
     if (mBufVboLen > 0) {
+#ifdef ENABLE_STATIC_BAKE
+        // While a static bake is recording, a flush is where the batch gets captured instead of
+        // drawn - the display list is being walked to *produce* an object-space payload, not to
+        // put anything on screen this pass. See fast/StaticMeshCache.h.
+        if (gStaticBakeRecording) {
+            StaticBakeCaptureFlush(this);
+            mBufVboLen = 0;
+            mBufVboNumTris = 0;
+            return;
+        }
+#endif
         gPerfCounters.draws++;
         gPerfCounters.tris += mBufVboNumTris;
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
@@ -493,6 +505,11 @@ void Interpreter::TextureCacheClear() {
 }
 
 void Interpreter::ShaderCacheClear() {
+#ifdef ENABLE_STATIC_BAKE
+    // Baked draw tables hold raw ShaderProgram* into the pool that is about to be emptied. Send
+    // every entry back to UNBAKED so it re-records against the rebuilt programs.
+    StaticBakeInvalidateAll();
+#endif
     mRapi->ClearShaderCache();
 }
 
@@ -1795,7 +1812,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // if (rand()%2) return;
 
-    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
+#ifdef ENABLE_STATIC_BAKE
+    // A static bake records this display list in object space (see fast/StaticMeshCache.h), so
+    // neither of the two view-dependent rejections below means anything during that pass: the
+    // clip flags were computed against a near-identity matrix, and "backfacing" in object space
+    // is not backfacing from the camera. Both are skipped here; the cull decision is not
+    // discarded, it is handed to the rasterizer at replay (see StaticBakeNoteMaterial below).
+    const bool bakeRecording = gStaticBakeRecording;
+#else
+    constexpr bool bakeRecording = false;
+#endif
+
+    if (!bakeRecording && (v1->clip_rej & v2->clip_rej & v3->clip_rej)) {
         // The whole triangle lies outside the visible area
         return;
     }
@@ -1804,7 +1832,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     const uint32_t cull_front = get_attr(CULL_FRONT);
     const uint32_t cull_back = get_attr(CULL_BACK);
 
-    if ((mRsp->geometry_mode & cull_both) != 0) {
+    if (!bakeRecording && (mRsp->geometry_mode & cull_both) != 0) {
         float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
         float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
         float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
@@ -2104,14 +2132,36 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+#ifdef ENABLE_STATIC_BAKE
+    if (bakeRecording) {
+        // The cull decision this pass is skipping, in ucode-independent terms, so the replay can
+        // hand it to the rasterizer instead.
+        const uint32_t cull_type = mRsp->geometry_mode & cull_both;
+        uint8_t bake_cull = STATIC_BAKE_CULL_NONE;
+        if (cull_type != 0) {
+            if (cull_type == cull_both) {
+                bake_cull = STATIC_BAKE_CULL_BOTH;
+            } else if (cull_type == cull_front) {
+                bake_cull = STATIC_BAKE_CULL_FRONT;
+            } else if (cull_type == cull_back) {
+                bake_cull = STATIC_BAKE_CULL_BACK;
+            }
+        }
+        StaticBakeNoteMaterial(this, use_fog, use_blend_color, use_grayscale, usedTextures[0], usedTextures[1],
+                               bake_cull);
+    }
+#endif
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
-        if (clip_parameters.z_is_from_0_to_1) {
+        // The 0..1 depth remap belongs to the projection, so during a bake it is left to the
+        // replay shader instead of being burned into an object-space payload.
+        if (!bakeRecording && clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
 
         mBufVbo[mBufVboLen++] = v_arr[i]->x;
-        mBufVbo[mBufVboLen++] = clip_parameters.invertY ? -v_arr[i]->y : v_arr[i]->y;
+        mBufVbo[mBufVboLen++] = (clip_parameters.invertY && !bakeRecording) ? -v_arr[i]->y : v_arr[i]->y;
         mBufVbo[mBufVboLen++] = z;
         mBufVbo[mBufVboLen++] = w;
 
@@ -3724,6 +3774,13 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
+#ifdef ENABLE_STATIC_BAKE
+            // A registered static mesh either replays from its GPU buffer (and the walk below is
+            // skipped entirely) or is about to be recorded by that same walk.
+            if (StaticBakeIntercept(gfx, subGFX)) {
+                return false;
+            }
+#endif
             g_exec_stack.call(*cmd0, subGFX);
         }
     } else {
@@ -3816,6 +3873,13 @@ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mMarkerOn = false;
     g_exec_stack.ret();
+#ifdef ENABLE_STATIC_BAKE
+    // Only a return can unwind past the display list a bake was opened on, so this is the one
+    // place a recording can end.
+    if (gStaticBakeRecording) {
+        StaticBakeOnEndDl(gfx);
+    }
+#endif
     return true;
 }
 
@@ -4879,6 +4943,15 @@ static void gfx_step() {
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
+#ifdef ENABLE_STATIC_BAKE
+    // Opcode whitelist for a bake in progress: anything the recorder cannot reproduce abandons
+    // the bake for good rather than being guessed at. One predictable branch on a global outside
+    // a recording, which is all but always.
+    if (gStaticBakeRecording) {
+        StaticBakeOnOpcode(mInstance.lock().get(), opcode);
+    }
+#endif
+
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
         Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gEnableGFXTrace", 0)) {
@@ -5184,6 +5257,15 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         }
         gfx_step();
     }
+
+#ifdef ENABLE_STATIC_BAKE
+    // Normally impossible: a recording ends at the G_ENDDL of the list that opened it. If the
+    // walk stopped some other way (a debugger breakpoint, a malformed list), unwind here rather
+    // than carrying the identity matrix into the next frame.
+    if (gStaticBakeRecording) {
+        StaticBakeEndFrame(this);
+    }
+#endif
 
     Flush();
     mGfxFrameBuffer = 0;
