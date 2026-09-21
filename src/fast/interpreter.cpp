@@ -467,6 +467,14 @@ void Interpreter::SetResolvedResourceCacheEnabled(bool enabled) {
     }
 }
 
+bool Interpreter::IsResolvedResourceCacheEnabled() const {
+    return mResolvedResourceCacheEnabled;
+}
+
+uint64_t Interpreter::GetResolvedResourceCacheRepaths() const {
+    return mResolvedResourceCacheRepaths;
+}
+
 // Texture binds resolve the same paths every frame; skip the resource
 // manager's string/hash/mutex work by memoizing on the pointer.
 std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* path) {
@@ -478,14 +486,23 @@ std::shared_ptr<Ship::IResource> Interpreter::ResolveResourceCached(const char* 
     }
     auto it = mResolvedResourceCache.find(path);
     if (it != mResolvedResourceCache.end()) {
-        return it->second;
+        // The pointer alone is not the key's whole meaning. A buffer that is rewritten
+        // with another path in place (SoH copies each glyph's path into the message
+        // font's slots) keeps its address, so compare the text, which is still far
+        // cheaper than the lookup it saves.
+        if (it->second.Path == path) {
+            return it->second.Resource;
+        }
+        mResolvedResourceCacheRepaths++;
     }
     auto res = Ship::Context::GetRawInstance()->GetResourceManager()->LoadResourceProcess(path);
     // Only memoize a hit. The resource manager caches its own misses, so re-asking
     // for one is cheap, and CacheExternalResource can turn a path that missed into a
     // valid resource at runtime. A memoized null would outlive the resource itself.
     if (res != nullptr) {
-        mResolvedResourceCache[path] = res;
+        mResolvedResourceCache[path] = { path, res };
+    } else if (it != mResolvedResourceCache.end()) {
+        mResolvedResourceCache.erase(it);
     }
     return res;
 }

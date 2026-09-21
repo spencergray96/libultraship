@@ -438,9 +438,13 @@ class Interpreter {
     void ImportTextureMask(int i, int tile);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
     // Opt-in memoization of OTR texture-path resolution, keyed by display-list
-    // pointer and dropped with the texture cache. Safe for ports whose display
-    // lists carry stable path pointers; off by default.
+    // pointer and dropped with the texture cache; off by default. A hit is only
+    // trusted when the address still holds the path it was memoized with, because
+    // a port may reuse one buffer for many paths (SoH's message font buffer).
     void SetResolvedResourceCacheEnabled(bool enabled);
+    bool IsResolvedResourceCacheEnabled() const;
+    // How many hits found their address holding a different path since startup.
+    uint64_t GetResolvedResourceCacheRepaths() const;
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
@@ -507,8 +511,13 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
-    std::unordered_map<const void*, std::shared_ptr<Ship::IResource>> mResolvedResourceCache;
+    struct ResolvedResource {
+        std::string Path;
+        std::shared_ptr<Ship::IResource> Resource;
+    };
+    std::unordered_map<const void*, ResolvedResource> mResolvedResourceCache;
     bool mResolvedResourceCacheEnabled = false;
+    uint64_t mResolvedResourceCacheRepaths = 0;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
