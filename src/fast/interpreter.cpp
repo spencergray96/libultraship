@@ -530,6 +530,16 @@ void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
 }
 
+// Count an entry once per frame that binds it, for PerfCounters::lastTexEntriesUsed: the frame's
+// texture working set, which is what has to fit under TEXTURE_CACHE_MAX_SIZE (sturdy-bassoon#141).
+static inline void NoteTextureEntryUsed(TextureCacheValue& value) {
+    const uint64_t stamp = gPerfCounters.frames + 1;
+    if (value.used_in_frame != stamp) {
+        value.used_in_frame = stamp;
+        gPerfCounters.texEntriesUsed++;
+    }
+}
+
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
@@ -539,6 +549,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         *n = &*it;
         mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
                                  it->second.lru_location); // move to back
+        NoteTextureEntryUsed(it->second);
         return true;
     }
 
@@ -552,6 +563,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         }
         mTextureCache.map.erase(it);
         mTextureCache.lru.pop_front();
+        gPerfCounters.texEvictions++;
     }
 
     uint32_t texture_id;
@@ -566,6 +578,10 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheNode* node = &*it;
     node->second.texture_id = texture_id;
     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
+    // Counted at the miss: the caller uploads next. ImportTexture can still return before it does
+    // (its zero-size guard, an unsupported format), so this is an upper bound on real uploads.
+    gPerfCounters.texUploads++;
+    NoteTextureEntryUsed(node->second);
 
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
@@ -5285,6 +5301,10 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 #endif
 
     Flush();
+    // The cache's occupancy as this frame leaves it: one read here instead of one at every insert,
+    // erase and clear. A clear between frames (gfx_texture_cache_clear) shows at the next frame.
+    gPerfCounters.texCacheSize = mTextureCache.map.size();
+    gPerfCounters.texCacheMax = TEXTURE_CACHE_MAX_SIZE;
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 

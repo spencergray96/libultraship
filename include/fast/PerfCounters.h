@@ -11,9 +11,9 @@
 // or batching work has to beat, and the only way to tell per-vertex cost apart from draw-call
 // count.
 //
-// Cost budget: one steady_clock pair per rendered frame, and three integer adds per flush. No
-// allocation, no logging, no locking - instrumentation that moved the figures it measures would
-// be worthless.
+// Cost budget: one steady_clock pair per rendered frame, three integer adds per flush, and a few
+// integer operations per texture-cache lookup. No allocation, no logging, no locking -
+// instrumentation that moved the figures it measures would be worthless.
 //
 // Threading: written only from the thread that runs Interpreter::Run, and meant to be read from
 // that same thread. Values are plain rather than atomic because making them atomic would cost
@@ -34,6 +34,20 @@ struct PerfCounters {
                          // geometry never reaches GfxSpTri1, so it is neither CPU-culled nor
                          // counted there, and adding the two would compare unlike numbers
 
+    // The texture cache (Interpreter::TextureCacheLookup, sturdy-bassoon#141). Past texCacheMax
+    // entries a miss frees the least recently used entry, and that texture is uploaded again the
+    // next time anything draws it. Nothing else reports that, so without these a frame bound by
+    // re-uploads would read like any other draw cost.
+    uint64_t texUploads;     // cache misses: each allocates an entry and uploads its texture
+    uint64_t texEvictions;   // entries freed by the LRU to make room for a miss. Clears and
+                             // gSPInvalidateTexCache deletes are not evictions and do not count
+    uint64_t texEntriesUsed; // summed over frames: an entry counts once in each frame that binds it
+
+    // Gauges, not totals: read them as they are, never as a difference between two snapshots.
+    uint64_t texCacheSize; // texture-cache entries resident when the last frame ended. Falls only
+                           // when entries are cleared or deleted, never on a scene change of its own
+    uint64_t texCacheMax;  // the cap the eviction test uses (TEXTURE_CACHE_MAX_SIZE)
+
     // The most recently completed rendered frame on its own, published by PerfCountersEndFrame.
     // A fixed viewpoint makes these stable frame to frame, so lastTris is directly comparable to
     // a scene's known triangle count in a way a windowed mean would not be.
@@ -43,6 +57,8 @@ struct PerfCounters {
     uint64_t lastTris;
     uint64_t lastDrawsBaked;
     uint64_t lastTrisBaked;
+    uint64_t lastTexEntriesUsed; // distinct cache entries the frame bound: its texture working set,
+                                 // which is what has to fit under texCacheMax to avoid re-uploads
 };
 
 // The live block. The hot path increments it directly so a flush costs an add rather than a
