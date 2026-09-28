@@ -27,18 +27,38 @@ enum StaticBakeCull : uint8_t {
     STATIC_BAKE_CULL_BOTH, // recording-side only: GfxSpTri1 drops these, so the bake is refused
 };
 
+// Directional lights the replay shader can light a baked vertex with. OoT binds at most 7
+// (Lights_FindSlot), and rooms get two - the environment's dirLight1/2. A frame that has more is
+// interpreted instead of replayed (StaticBakeIntercept), so this is a limit on the bake, never on
+// the picture.
+constexpr int STATIC_BAKE_MAX_DIR_LIGHTS = 7;
+
+// A recorded vertex that was lit under G_LIGHTING carries its raw object-space normal where its
+// lit colour would have gone, and this value in position.w to say so. Recorded w is otherwise
+// always exactly 1 (the record pass runs under a near-identity matrix), and the replay shader
+// rebuilds w from the camera, so the slot is free.
+constexpr float STATIC_BAKE_LIT_W = 2.0f;
+
 // Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the
 // vertex payload by the CPU. See fast/StaticMeshCache.h. Laid out to be memcpy'd straight into a
-// 16-byte-aligned constant buffer.
+// 16-byte-aligned constant buffer: the HLSL cbuffer in StaticBakePatchSource mirrors it member for
+// member, and HLSL packs each float4 (and each array element) on a 16-byte register.
 struct StaticBakeUniforms {
     // Camera * projection as the interpreter would have applied it, with the widescreen X
     // adjustment folded in. Row-major, i.e. the same memory order as RSP::MP_matrix, so
     // clip = mul(float4(objectPos, 1), mvp) in HLSL.
     float mvp[4][4];
     float fogColor[4];
-    float fogMul;    // RSP fog_mul, as G_MW_FOG left it
-    float fogOffset; // RSP fog_offset
-    float pad[2];    // constant buffers are multiples of 16 bytes
+    float fogMul;          // RSP fog_mul, as G_MW_FOG left it
+    float fogOffset;       // RSP fog_offset
+    uint32_t numDirLights; // RSP current_num_lights - 1 (the last light is the ambient one)
+    float pad;
+    // The light state GfxSpVertex would have lit a vertex with, in the same units it uses:
+    // colours are the lights' 0..255 bytes, and each direction is CalculateNormalDir's output - the
+    // light's direction in the display list's object space, normalised. Only xyz / rgb are read.
+    float ambient[4];
+    float lightDir[STATIC_BAKE_MAX_DIR_LIGHTS][4];
+    float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
 };
 
 // A hash function used to hash a: pair<float, float>
@@ -119,8 +139,11 @@ class GfxRenderingAPI {
     virtual void DeleteStaticBuffer(uint32_t bufferId) {
     }
     // Build (or find) the transform-enabled twin of an already-created shader program. Returning
-    // false rejects the bake rather than drawing something wrong.
-    virtual bool PrepareStaticShader(struct ShaderProgram* prg) {
+    // false rejects the bake rather than drawing something wrong. shadeMask has bit j set when the
+    // program's colour input j is SHADE: the twin lights those inputs from the recorded normal.
+    // The program alone cannot say which input that is (inputs are numbered by first use in the
+    // combiner), so the same program can need more than one twin.
+    virtual bool PrepareStaticShader(struct ShaderProgram* prg, uint8_t shadeMask) {
         return false;
     }
     // Floats per vertex the given program's input layout expects - used to cross-check the stride
@@ -133,7 +156,8 @@ class GfxRenderingAPI {
     // draws, and leaves the backend's "currently bound" memo invalidated so the next interpreted
     // draw rebinds from scratch.
     virtual void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
-                                     const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) {
+                                     uint8_t shadeMask, const StaticBakeUniforms& uniforms, uint8_t cullMode,
+                                     bool zmodeDecal) {
     }
 
   protected:

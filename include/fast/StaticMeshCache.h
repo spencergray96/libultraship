@@ -4,7 +4,8 @@
 #include <stddef.h>
 
 // Static-geometry bake - record a room's display list once, replay it from a persistent GPU
-// buffer with the camera as a uniform (sturdy-bassoon#40 Stage 1, prototype).
+// buffer with the camera, fog and lights as uniforms (sturdy-bassoon#40 Stage 1; lighting moved
+// into the replay by sturdy-bassoon#142).
 //
 // Why this exists: the Fast3D interpreter re-walks every room display list once per *rendered*
 // frame, transforming and lighting every vertex on the CPU and streaming the result to a dynamic
@@ -21,7 +22,10 @@
 // failure mode, is designed out rather than debugged.
 //
 // Replay binds the same shader with a transform-enabled vertex stage, supplies the current
-// camera/fog as uniforms, and skips the walk.
+// camera/fog/lights as uniforms, and skips the walk. Lighting stays per vertex, as the interpreter
+// does it: a lit vertex is recorded with its normal where its lit colour would have gone, and the
+// vertex stage runs GfxSpVertex's directional-light sum on it. So a light change - time of day,
+// the Sun's Song - costs nothing, where a recording of lit colours would have to be redone.
 //
 // Safety model: a display list is only ever considered if the host explicitly registered it
 // (compiled-in custom scenes only - vanilla display lists are never registered, so they can never
@@ -87,9 +91,15 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode);
 // Material-level whitelist, from GfxSpTri1: the recorder can only reproduce untextured,
 // non-grayscale materials whose fog (if any) it is able to recompute in the vertex shader.
 // cullCode is a StaticBakeCull value - the CPU cull decision the recording is skipping, which the
-// replay hands to the rasterizer instead.
+// replay hands to the rasterizer instead. shadeMask has bit j set when colour input j is SHADE,
+// the input a lit vertex records its normal in.
 void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, bool useGrayscale,
-                            bool usedTexture0, bool usedTexture1, uint8_t cullCode);
+                            bool usedTexture0, bool usedTexture1, uint8_t cullCode, uint8_t shadeMask);
+
+// Refuse the bake in progress, for something met outside the opcode and material checks - from
+// GfxSpVertex, a lit vertex using lighting the replay shader does not model. The display list
+// finishes its walk and is then interpreted for good. No-op when nothing is recording.
+void StaticBakeAbort(Interpreter* gfx, const char* reason);
 
 // Safety net: a display list that never returns would otherwise leave recording armed across
 // frames. Called once at the end of Interpreter::Run.

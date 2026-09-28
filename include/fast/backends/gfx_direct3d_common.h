@@ -6,6 +6,7 @@
 #include "../interpreter.h"
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
@@ -128,10 +129,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool SupportsStaticBake() override;
     uint32_t CreateStaticBuffer(const void* data, size_t sizeBytes) override;
     void DeleteStaticBuffer(uint32_t bufferId) override;
-    bool PrepareStaticShader(struct ShaderProgram* prg) override;
+    bool PrepareStaticShader(struct ShaderProgram* prg, uint8_t shadeMask) override;
     uint8_t GetShaderNumFloats(struct ShaderProgram* prg) override;
     void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
-                             const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) override;
+                             uint8_t shadeMask, const StaticBakeUniforms& uniforms, uint8_t cullMode,
+                             bool zmodeDecal) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -154,9 +156,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Bind a rasterizer that culls the way the RSP asked, for one baked draw. Invalidates the
     // interpreted path's rasterizer memo so it rebinds its own (cull-none) state afterwards.
     void ApplyStaticRasterState(uint8_t cullMode, bool zmodeDecal);
-    // The transform-enabled twin of a program, compiled on first use. Null if the generated HLSL
-    // did not carry the markers the patch needs (see StaticBakePatchSource).
-    struct ShaderProgramD3D11* LookupOrCreateStaticShader(struct ShaderProgramD3D11* base);
+    // The transform-enabled twin of a program, compiled on first use, lighting the colour inputs
+    // in shadeMask. Null if shadeMask names an input the program lacks, if the generated HLSL did
+    // not carry the markers the patch needs (see StaticBakePatchSource), or if it did not compile.
+    struct ShaderProgramD3D11* LookupOrCreateStaticShader(struct ShaderProgramD3D11* base, uint8_t shadeMask);
 
     HMODULE mDX11Module;
 
@@ -190,13 +193,18 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerPrimDepthCB mPerPrimDepthCbData;
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
-    // Transform-enabled twins, same keys. A separate pool so LookupShader() can never hand the
-    // interpreter a baked program by accident. std::map nodes are address-stable, which is what
-    // lets StaticMeshCache hold raw ShaderProgram* across further insertions.
-    std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mStaticShaderPool;
+    // Transform-enabled twins, keyed as above plus the shade mask they light. A separate pool so
+    // LookupShader() can never hand the interpreter a baked program by accident. std::map nodes are
+    // address-stable, which is what lets StaticMeshCache hold raw ShaderProgram* across further
+    // insertions.
+    std::map<std::tuple<uint64_t, uint32_t, uint8_t>, struct ShaderProgramD3D11> mStaticShaderPool;
     // Persistent vertex buffers for baked meshes. Index 0 is never handed out (0 means failure).
     std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> mStaticBuffers;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeCb;
+    // What mStaticBakeCb holds. Every draw of a replayed room passes the same uniforms, so this
+    // turns a map-and-upload per draw into one per room.
+    StaticBakeUniforms mStaticBakeCbData = {};
+    bool mStaticBakeCbValid = false;
     // Rasterizer states for baked draws, indexed cullMode * 2 + zmodeDecal. Built on demand and
     // kept, because a baked draw binds one every frame.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mStaticRasterizers[6];

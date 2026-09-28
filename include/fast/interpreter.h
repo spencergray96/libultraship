@@ -222,6 +222,11 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+    // For the static bake (fast/StaticMeshCache.h): whether GfxSpVertex lit this vertex, and the
+    // normal it lit it from. A recording stores these instead of the lit colour, so the replay
+    // shader can light the vertex under whatever lights are current.
+    bool lit;
+    int8_t normal[3];
 };
 
 struct RawTexMetadata {

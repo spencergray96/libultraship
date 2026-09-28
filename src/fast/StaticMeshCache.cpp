@@ -32,7 +32,8 @@ struct BakedDraw {
     ShaderProgram* prg;
     uint8_t numFloats;
     uint8_t depthTestAndMask;
-    uint8_t cull; // StaticBakeCull - what GfxSpTri1's CPU cull test would have done
+    uint8_t cull;      // StaticBakeCull - what GfxSpTri1's CPU cull test would have done
+    uint8_t shadeMask; // colour inputs that are SHADE, which the replay shader lights
     bool decal;
     bool alphaBlend;
     uint16_t primDepth;
@@ -44,13 +45,6 @@ struct Entry {
     std::vector<BakedDraw> draws;
     uint32_t buffer = 0;
     size_t totalTris = 0;
-
-    // The light state the vertex colours were lit under. Rooms are drawn with G_LIGHTING set and
-    // the vertex normal in the colour slot, so a time-of-day change makes the baked colours
-    // stale. Comparing what the interpreter is actually about to use against what it used at
-    // record time is exact - no epsilon to tune, and no second copy of the light maths.
-    uint8_t numLights = 0;
-    F3DLight lights[MAX_LIGHTS + 1] = {};
 };
 
 std::unordered_map<const void*, Entry> sEntries;
@@ -68,9 +62,11 @@ size_t sRecordDepth = 0;
 float sSavedMpMatrix[4][4];
 bool sRecordAborted = false;
 const char* sAbortReason = nullptr;
-// The cull mode the triangles now in the interpreter's staging buffer were emitted under. 0xFF
-// until the first triangle of a recording, so that first triangle always opens a fresh batch.
+// The cull mode and shade-input mask the triangles now in the interpreter's staging buffer were
+// emitted under. 0xFF until the first triangle of a recording, so that first triangle always opens
+// a fresh batch. (0xFF is never a real mask: a combiner has at most 7 inputs.)
 uint8_t sRecordCull = 0xFF;
+uint8_t sRecordShadeMask = 0xFF;
 
 // Opcodes the recorder understands. Anything else - a matrix load, a segment write, a texture
 // load, a branch_z - means the display list is doing something the replay could not reproduce,
@@ -160,17 +156,29 @@ void BeginRecording(Interpreter* gfx, const void* key, Entry& e) {
     e.staging.clear();
     e.draws.clear();
     e.totalTris = 0;
-    e.numLights = gfx->mRsp->current_num_lights;
-    memcpy(e.lights, gfx->mRsp->current_lights, sizeof(e.lights));
 
     sRecording = &e;
     sRecordingKey = key;
     sRecordAborted = false;
     sAbortReason = nullptr;
     sRecordCull = 0xFF;
+    sRecordShadeMask = 0xFF;
     // g_exec_stack.call() pushes exactly one frame for the display list we are about to enter.
     sRecordDepth = g_exec_stack.cmd_stack.size() + 1;
     gStaticBakeRecording = true;
+}
+
+// The RSP counts the ambient light among its lights, last.
+int NumDirLights(Interpreter* gfx) {
+    return (int)gfx->mRsp->current_num_lights - 1;
+}
+
+// Can the replay shader light this frame? It carries a fixed number of directional lights, and
+// there has to be an ambient one. A frame that fails this is interpreted, not replayed: the bake
+// itself holds no lighting, so it is still good for the next frame that passes.
+bool LightsFitReplay(Interpreter* gfx) {
+    const int numDir = NumDirLights(gfx);
+    return numDir >= 0 && numDir <= STATIC_BAKE_MAX_DIR_LIGHTS;
 }
 
 void Replay(Interpreter* gfx, Entry& e) {
@@ -209,6 +217,24 @@ void Replay(Interpreter* gfx, Entry& e) {
     u.fogMul = (float)gfx->mRsp->fog_mul;
     u.fogOffset = (float)gfx->mRsp->fog_offset;
 
+    // The lights, as GfxSpVertex would read them for this display list: the last one is the
+    // ambient, and each directional light's direction goes through CalculateNormalDir under the
+    // current modelview - the same call, so the replay shader lights from the same numbers.
+    // StaticBakeIntercept has already checked the count fits.
+    const int numDir = NumDirLights(gfx);
+    const F3DLight_t& ambient = gfx->mRsp->current_lights[numDir].l;
+    for (int c = 0; c < 3; c++) {
+        u.ambient[c] = (float)ambient.col[c];
+    }
+    u.numDirLights = (uint32_t)numDir;
+    for (int i = 0; i < numDir; i++) {
+        const F3DLight_t& light = gfx->mRsp->current_lights[i].l;
+        gfx->CalculateNormalDir(&light, u.lightDir[i]);
+        for (int c = 0; c < 3; c++) {
+            u.lightColor[i][c] = (float)light.col[c];
+        }
+    }
+
     for (const BakedDraw& d : e.draws) {
         const bool depthTest = (d.depthTestAndMask & 1) != 0;
         const bool depthMask = (d.depthTestAndMask & 2) != 0;
@@ -225,7 +251,7 @@ void Replay(Interpreter* gfx, Entry& e) {
             gfx->mRenderingState.alpha_blend = d.alphaBlend;
         }
         gfx->mRapi->SetCurrentPrimDepth((float)d.primDepth / 32767.0f);
-        gfx->mRapi->DrawStaticTriangles(e.buffer, d.byteOffset, d.numTris, d.prg, u, d.cull, d.decal);
+        gfx->mRapi->DrawStaticTriangles(e.buffer, d.byteOffset, d.numTris, d.prg, d.shadeMask, u, d.cull, d.decal);
 
         gPerfCounters.draws++;
         gPerfCounters.drawsBaked++;
@@ -236,17 +262,6 @@ void Replay(Interpreter* gfx, Entry& e) {
     // about. Clearing the memo makes the next interpreted triangle re-run its own binding path;
     // without it the corruption shows up in whatever draws *after* a baked room, not in the room.
     gfx->mRenderingState.mShaderProgram = nullptr;
-}
-
-// Have the lights the room is about to be drawn with moved since it was baked? The light block is
-// a handful of bytes of u8 colour and s8 direction per light, so this is an exact comparison over
-// (typically) two lights - no threshold, and it cannot drift the way a re-derived hash would.
-bool LightsChanged(Interpreter* gfx, const Entry& e) {
-    if (gfx->mRsp->current_num_lights != e.numLights) {
-        return true;
-    }
-    const size_t n = (size_t)e.numLights;
-    return memcmp(e.lights, gfx->mRsp->current_lights, n * sizeof(F3DLight)) != 0;
 }
 
 void FinishRecording(Interpreter* gfx) {
@@ -275,7 +290,7 @@ void FinishRecording(Interpreter* gfx) {
     // uploaded rather than diagnosed from a corrupt frame.
     if (!rejected) {
         for (const BakedDraw& d : e->draws) {
-            if (!gfx->mRapi->PrepareStaticShader(d.prg)) {
+            if (!gfx->mRapi->PrepareStaticShader(d.prg, d.shadeMask)) {
                 rejected = true;
                 reason = "no transform-enabled shader variant";
                 break;
@@ -408,14 +423,13 @@ bool StaticBakeIntercept(Interpreter* gfx, void* displayList) {
     if (e.state == BakeState::Rejected) {
         return false;
     }
+    // Checked before recording as well as before replaying, because a recording ends by replaying.
+    if (!LightsFitReplay(gfx)) {
+        return false;
+    }
     if (e.state == BakeState::Baked) {
-        if (LightsChanged(gfx, e)) {
-            ReleaseGpu(e);
-            e.state = BakeState::Unbaked;
-        } else {
-            Replay(gfx, e);
-            return true;
-        }
+        Replay(gfx, e);
+        return true;
     }
 
     if (!gfx->mRapi->SupportsStaticBake()) {
@@ -449,9 +463,10 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     const bool alphaBlend = gfx->mRenderingState.alpha_blend;
     ShaderProgram* prg = gfx->mRenderingState.mShaderProgram;
     const uint16_t primDepth = gfx->mRdp->prim_depth;
-    // StaticBakeNoteMaterial closes the batch before the cull mode changes, so this is the mode
-    // every triangle in the buffer was emitted under.
+    // StaticBakeNoteMaterial closes the batch before the cull mode or the shade mask changes, so
+    // these are what every triangle in the buffer was emitted under.
     const uint8_t cull = sRecordCull == 0xFF ? (uint8_t)STATIC_BAKE_CULL_NONE : sRecordCull;
+    const uint8_t shadeMask = sRecordShadeMask == 0xFF ? 0 : sRecordShadeMask;
 
     if (prg == nullptr) {
         AbortRecording(gfx, "a batch was flushed with no shader program bound");
@@ -467,7 +482,8 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     if (!e->draws.empty()) {
         BakedDraw& prev = e->draws.back();
         if (prev.prg == prg && prev.numFloats == floatsPerVertex && prev.depthTestAndMask == depthTestAndMask &&
-            prev.cull == cull && prev.decal == decal && prev.alphaBlend == alphaBlend && prev.primDepth == primDepth &&
+            prev.cull == cull && prev.shadeMask == shadeMask && prev.decal == decal && prev.alphaBlend == alphaBlend &&
+            prev.primDepth == primDepth &&
             prev.byteOffset + prev.numTris * 3 * floatsPerVertex * sizeof(float) == byteOffset) {
             prev.numTris += gfx->mBufVboNumTris;
             return;
@@ -481,6 +497,7 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     d.numFloats = (uint8_t)floatsPerVertex;
     d.depthTestAndMask = depthTestAndMask;
     d.cull = cull;
+    d.shadeMask = shadeMask;
     d.decal = decal;
     d.alphaBlend = alphaBlend;
     d.primDepth = primDepth;
@@ -514,7 +531,7 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode) {
 }
 
 void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, bool useGrayscale, bool usedTexture0,
-                            bool usedTexture1, uint8_t cullCode) {
+                            bool usedTexture1, uint8_t cullCode, uint8_t shadeMask) {
     // Each of these would need its own replay-side handling that this prototype does not have:
     // textures need the sampler bindings restored, and grayscale and blend-colour fog carry
     // per-frame RDP colours in the vertex payload.
@@ -546,11 +563,21 @@ void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, b
     // Carry the RSP's cull mode into the recording so the replay can ask the rasterizer for it.
     // A cull-mode change does not flush the interpreter's batch (it is a CPU-side decision there),
     // so close the batch here: one baked draw can only have one rasterizer state.
+    //
+    // The shade mask is the same story. Two combiners can share one shader program with SHADE on
+    // different inputs, and the interpreter does not flush between them (the program did not
+    // change; only which input is fed the vertex colour did). The replay shader lights a fixed
+    // input, so one baked draw can only have one mask.
     const uint8_t cull = cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : cullCode;
-    if (cull != sRecordCull) {
-        gfx->Flush(); // captures what is buffered under the *previous* mode
+    if (cull != sRecordCull || shadeMask != sRecordShadeMask) {
+        gfx->Flush(); // captures what is buffered under the *previous* mode and mask
         sRecordCull = cull;
+        sRecordShadeMask = shadeMask;
     }
+}
+
+void StaticBakeAbort(Interpreter* gfx, const char* reason) {
+    AbortRecording(gfx, reason);
 }
 
 void StaticBakeEndFrame(Interpreter* gfx) {

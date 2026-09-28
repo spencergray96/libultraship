@@ -900,8 +900,11 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //   * recomputes the fog factor from the *unremapped* clip z/w with the same clamp and the same
 //     division-by-zero guard as GfxSpVertex, and takes the fog colour from the uniform - the
 //     recorded fog bytes are dead weight (the record pass saw an identity matrix), which is why
-//     fog changes need no rebake.
-static bool StaticBakePatchSource(std::string& src, bool hasFog) {
+//     fog changes need no rebake;
+//   * lights each colour input in shadeMask (the SHADE inputs) from the normal a lit vertex was
+//     recorded with, under the current lights - which is why light changes need no rebake either.
+//     Only a vertex flagged lit in position.w is lit; an unlit one keeps its recorded colour.
+static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
 
@@ -918,14 +921,62 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog) {
         return false;
     }
 
+    // Member for member the layout of StaticBakeUniforms: HLSL starts every float4 and every array
+    // element on a new 16-byte register, and packs the float2, uint and float between them into one.
+    const std::string maxLights = std::to_string(STATIC_BAKE_MAX_DIR_LIGHTS);
     std::string cb = "cbuffer StaticBakeCB : register(b";
     cb += std::to_string(STATIC_BAKE_CB_SLOT);
     cb += ") {\n"
           "    row_major float4x4 uMVP;\n"
           "    float4 uFogColor;\n"
-          "    float4 uFogParams;\n" // x = fog_mul, y = fog_offset
-          "};\n\n";
+          "    float2 uFogParams;\n" // x = fog_mul, y = fog_offset
+          "    uint uNumDirLights;\n"
+          "    float uBakePad;\n"
+          "    float4 uAmbient;\n"
+          "    float4 uLightDir[" +
+          maxLights +
+          "];\n"
+          "    float4 uLightColor[" +
+          maxLights + "];\n};\n\n";
+
+    if (shadeMask != 0) {
+        // GfxSpVertex's directional-light sum, in its own order and units: start from the ambient
+        // bytes, add (n . dir) / 127 x colour per light that faces the vertex, truncating to a whole
+        // number after each light, and clamp at 255. `precise` stops the compiler fusing or
+        // reordering any of it, so each step rounds where the CPU's does. It does not make the GPU's
+        // division bit-exact, so a vertex can still land one step away in a channel.
+        cb += "float3 StaticBakeLight(float3 n) {\n"
+              "    precise float3 c = uAmbient.rgb;\n"
+              "    for (uint i = 0; i < uNumDirLights; i++) {\n"
+              "        precise float intensity = n.x * uLightDir[i].x;\n"
+              "        intensity = intensity + n.y * uLightDir[i].y;\n"
+              "        intensity = intensity + n.z * uLightDir[i].z;\n"
+              "        intensity = intensity / 127.0;\n"
+              "        if (intensity > 0.0) {\n"
+              "            c = trunc(c + intensity * uLightColor[i].rgb);\n"
+              "        }\n"
+              "    }\n"
+              "    return min(c, 255.0) / 255.0;\n"
+              "}\n\n";
+    }
     src.insert(vsAt, cb);
+
+    // Each SHADE input's pass-through line is `result.inputN = inputN;`, or
+    // `result.inputN = float4(inputN, 1.0);` without alpha. Light it right after, from what it just
+    // copied: for a lit vertex that is the normal in .rgb, with the vertex's own alpha untouched.
+    static_assert(STATIC_BAKE_LIT_W == 2.0f, "the lit test below splits recorded w = 1 from w = 2");
+    for (int j = 0; (shadeMask >> j) != 0; j++) {
+        if ((shadeMask & (1 << j)) == 0) {
+            continue;
+        }
+        const std::string name = "result.input" + std::to_string(j + 1);
+        const size_t at = src.find(name + " = ", vsAt + cb.size()); // within VSMain, not PSMain
+        const size_t end = at == std::string::npos ? std::string::npos : src.find(';', at);
+        if (end == std::string::npos) {
+            return false;
+        }
+        src.insert(end + 1, "\n    if (position.w > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
+    }
 
     std::string posCode = "float4 bakeClip = mul(float4(position.xyz, 1.0), uMVP);\n"
                           "    result.position = float4(bakeClip.x, bakeClip.y, "
@@ -949,8 +1000,9 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog) {
     return true;
 }
 
-struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struct ShaderProgramD3D11* base) {
-    const auto key = std::make_pair(base->shader_id0, (uint32_t)base->shader_id1);
+struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struct ShaderProgramD3D11* base,
+                                                                           uint8_t shadeMask) {
+    const auto key = std::make_tuple(base->shader_id0, (uint32_t)base->shader_id1, shadeMask);
     auto it = mStaticShaderPool.find(key);
     if (it != mStaticShaderPool.end()) {
         // A failed compile leaves a program with no vertex shader; remember that rather than
@@ -966,13 +1018,21 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
                                                           mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
 
     struct ShaderProgramD3D11* prg = &mStaticShaderPool[key];
-    if (!StaticBakePatchSource(source, cc_features.opt_fog)) {
+    if ((shadeMask >> cc_features.numInputs) != 0) {
+        // The recorder named a colour input this program does not have: a recording bug, not a
+        // template one, so there is no vertex stage worth dumping.
+        SPDLOG_ERROR("[staticbake] shade mask {:#x} names an input past the {} of shader {:#x}/{:#x}; it will stay "
+                     "interpreted",
+                     shadeMask, cc_features.numInputs, base->shader_id0, base->shader_id1);
+        return nullptr;
+    }
+    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask)) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");
         SPDLOG_ERROR("[staticbake] generated HLSL did not carry the expected vertex-stage markers; "
-                     "shader {:#x}/{:#x} will stay interpreted. Vertex stage as generated:\n{}",
-                     base->shader_id0, base->shader_id1,
+                     "shader {:#x}/{:#x} (shade mask {:#x}) will stay interpreted. Vertex stage as generated:\n{}",
+                     base->shader_id0, base->shader_id1, shadeMask,
                      at == std::string::npos ? source.substr(0, 600) : source.substr(at, 900));
         return nullptr;
     }
@@ -1044,11 +1104,11 @@ void GfxRenderingAPIDX11::DeleteStaticBuffer(uint32_t bufferId) {
     }
 }
 
-bool GfxRenderingAPIDX11::PrepareStaticShader(struct ShaderProgram* prg) {
+bool GfxRenderingAPIDX11::PrepareStaticShader(struct ShaderProgram* prg, uint8_t shadeMask) {
     if (prg == nullptr) {
         return false;
     }
-    return LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg) != nullptr;
+    return LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg, shadeMask) != nullptr;
 }
 
 uint8_t GfxRenderingAPIDX11::GetShaderNumFloats(struct ShaderProgram* prg) {
@@ -1056,12 +1116,12 @@ uint8_t GfxRenderingAPIDX11::GetShaderNumFloats(struct ShaderProgram* prg) {
 }
 
 void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris,
-                                              struct ShaderProgram* prg, const StaticBakeUniforms& uniforms,
-                                              uint8_t cullMode, bool zmodeDecal) {
+                                              struct ShaderProgram* prg, uint8_t shadeMask,
+                                              const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) {
     if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || numTris == 0) {
         return;
     }
-    struct ShaderProgramD3D11* variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg);
+    struct ShaderProgramD3D11* variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg, shadeMask);
     if (variant == nullptr) {
         return;
     }
@@ -1080,13 +1140,29 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffs
             SPDLOG_ERROR("[staticbake] failed to create the vertex-stage constant buffer");
             return;
         }
+        mStaticBakeCbValid = false;
     }
 
-    D3D11_MAPPED_SUBRESOURCE ms;
-    ZeroMemory(&ms, sizeof(ms));
-    mContext->Map(mStaticBakeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, &uniforms, sizeof(StaticBakeUniforms));
-    mContext->Unmap(mStaticBakeCb.Get(), 0);
+    // Nothing else writes this buffer, so what it last received is what it holds.
+    if (!mStaticBakeCbValid || memcmp(&mStaticBakeCbData, &uniforms, sizeof(StaticBakeUniforms)) != 0) {
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(ms));
+        if (FAILED(mContext->Map(mStaticBakeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+            // Skipping the draw beats drawing with stale lights. Once is enough to say so: this
+            // runs per draw, every frame.
+            static bool sReported = false;
+            if (!sReported) {
+                SPDLOG_ERROR("[staticbake] could not map the vertex-stage constant buffer; baked draws are skipped");
+                sReported = true;
+            }
+            mStaticBakeCbValid = false;
+            return;
+        }
+        memcpy(ms.pData, &uniforms, sizeof(StaticBakeUniforms));
+        mContext->Unmap(mStaticBakeCb.Get(), 0);
+        mStaticBakeCbData = uniforms;
+        mStaticBakeCbValid = true;
+    }
     mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 1, mStaticBakeCb.GetAddressOf());
 
     const uint32_t stride = variant->numFloats * sizeof(float);

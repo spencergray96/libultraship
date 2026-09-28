@@ -1742,6 +1742,21 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.g = g > 255 ? 255 : g;
             d->color.b = b > 255 ? 255 : b;
 
+#ifdef ENABLE_STATIC_BAKE
+            d->lit = true;
+            d->normal[0] = vn->n[0];
+            d->normal[1] = vn->n[1];
+            d->normal[2] = vn->n[2];
+            // The replay shader models the directional-light sum above and nothing else: point
+            // lights read the vertex's world position, and texture generation reads the camera's
+            // lookat, neither of which a recording can keep.
+            if (gStaticBakeRecording && (mRsp->geometry_mode & G_TEXTURE_GEN) != 0) {
+                StaticBakeAbort(this, "G_TEXTURE_GEN on a lit vertex");
+            } else if (gStaticBakeRecording && (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) != 0) {
+                StaticBakeAbort(this, "G_LIGHTING_POSITIONAL on a lit vertex");
+            }
+#endif
+
             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
                 dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
@@ -1777,6 +1792,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.r = v->cn[0];
             d->color.g = v->cn[1];
             d->color.b = v->cn[2];
+#ifdef ENABLE_STATIC_BAKE
+            d->lit = false;
+#endif
         }
 
         d->u = U;
@@ -2180,8 +2198,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 bake_cull = STATIC_BAKE_CULL_BACK;
             }
         }
+        // Which colour inputs are SHADE: a lit vertex records its normal there (below), and the
+        // replay shader has to know which input to light.
+        uint8_t bake_shade_mask = 0;
+        for (int j = 0; j < numInputs; j++) {
+            if (comb->shader_input_mapping[0][j] == G_CCMUX_SHADE) {
+                bake_shade_mask |= (uint8_t)(1 << j);
+            }
+        }
         StaticBakeNoteMaterial(this, use_fog, use_blend_color, use_grayscale, usedTextures[0], usedTextures[1],
-                               bake_cull);
+                               bake_cull, bake_shade_mask);
     }
 #endif
 
@@ -2192,11 +2218,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         if (!bakeRecording && clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
+        // Likewise the lighting: a lit vertex is recorded with its normal in place of its lit
+        // colour (the SHADE case below), and flagged in w for the replay shader to light it.
+        const bool bakeLit = bakeRecording && !is_rect && v_arr[i]->lit;
 
         mBufVbo[mBufVboLen++] = v_arr[i]->x;
         mBufVbo[mBufVboLen++] = (clip_parameters.invertY && !bakeRecording) ? -v_arr[i]->y : v_arr[i]->y;
         mBufVbo[mBufVboLen++] = z;
-        mBufVbo[mBufVboLen++] = w;
+        mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -2344,7 +2373,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         color = &tmp;
                         break;
                 }
-                if (k == 0) {
+                if (k == 0 && bakeLit && color == &v_arr[i]->color) {
+                    // The raw normal, as the integers GfxSpVertex lit from; see the shader's
+                    // StaticBakeLight for the other half.
+                    mBufVbo[mBufVboLen++] = v_arr[i]->normal[0];
+                    mBufVbo[mBufVboLen++] = v_arr[i]->normal[1];
+                    mBufVbo[mBufVboLen++] = v_arr[i]->normal[2];
+                } else if (k == 0) {
                     mBufVbo[mBufVboLen++] = color->r / 255.0f;
                     mBufVbo[mBufVboLen++] = color->g / 255.0f;
                     mBufVbo[mBufVboLen++] = color->b / 255.0f;
