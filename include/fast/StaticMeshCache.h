@@ -5,7 +5,7 @@
 
 // Static-geometry bake - record a room's display list once, replay it from a persistent GPU
 // buffer with the camera, fog and lights as uniforms (sturdy-bassoon#40 Stage 1; lighting moved
-// into the replay by sturdy-bassoon#142).
+// into the replay, and textured geometry admitted, by sturdy-bassoon#142).
 //
 // Why this exists: the Fast3D interpreter re-walks every room display list once per *rendered*
 // frame, transforming and lighting every vertex on the CPU and streaming the result to a dynamic
@@ -27,6 +27,14 @@
 // vertex stage runs GfxSpVertex's directional-light sum on it. So a light change - time of day,
 // the Sun's Song - costs nothing, where a recording of lit colours would have to be redone.
 //
+// Textures: the record pass lets the texture-load commands run, so the interpreter imports and
+// binds each texture exactly as it would live, and the UVs land in the payload already normalised
+// by the tile. Each baked draw then holds its OWN reference to the GPU texture and sampler it was
+// recorded with (GfxRenderingAPI::HoldStaticTexture) - not a texture-cache id, which an eviction can
+// hand to another texture, and not a cache pin, which every ocarina textbox's full cache clear
+// would have to be taught to skip. So nothing the cache does reaches a bake; only a real content
+// change (the alt-assets toggle, a texture-filter change) invalidates one.
+//
 // Safety model: a display list is only ever considered if the host explicitly registered it
 // (compiled-in custom scenes only - vanilla display lists are never registered, so they can never
 // take this path), and any command or material feature the recorder does not understand aborts
@@ -41,24 +49,33 @@ struct StaticBakeUniforms;
 // ---------------------------------------------------------------------------
 // Host-facing API
 //
-// Everything here is inert until StaticBakeSetEnabled(true). With the gate off there are no
-// registrations, so the interpreter hooks all early-out on an empty registry.
+// Everything here is inert until StaticBakeSetEnabled(true): with the gate off, every registered
+// display list is interpreted, and the interpreter's hooks early-out on the gate before looking
+// anything up.
 // ---------------------------------------------------------------------------
 
+// The runtime switch. Off: every display list is interpreted, and registrations and existing bakes
+// are kept, so switching back on replays them without re-recording. That is what makes a baked /
+// interpreted A/B possible within one session, at one camera. Safe to flip between frames.
 void StaticBakeSetEnabled(bool enabled);
 bool StaticBakeIsEnabled();
 
 // Offer one display list for baking. Keyed by pointer, which is only sound for display lists
 // whose address is a stable C symbol for the life of the process - i.e. compiled-in scene data.
 // Registering the same pointer twice is a no-op, so this is safe to call on every room init.
+// Registration does not depend on the gate, so a room loaded while the bake is off still bakes
+// when it is switched on.
 void StaticBakeRegister(const void* displayList);
 
 // Drop every registration and release every GPU buffer. Call on a scene change: the next scene's
 // display lists are different symbols, and nothing else would ever free the old buffers.
 void StaticBakeReset();
 
-// Send every baked entry back to UNBAKED so the next frame re-records it. Recording costs one
-// interpreted pass - what every frame costs today - so this is cheap enough to be naive.
+// Send every baked entry back to UNBAKED so the next frame re-records it, releasing its buffer and
+// held textures. Recording costs one interpreted pass - what every frame costs today - so this is
+// cheap enough to be naive. Call it when what a bake holds is no longer what the interpreter would
+// draw: a shader-cache clear, the alt-assets toggle, a texture-filter change. NOT on a plain
+// texture-cache clear (an ocarina textbox does one every time): bakes hold their own textures.
 void StaticBakeInvalidateAll();
 
 // How many display lists are registered, and how many of those are currently baked / rejected.
@@ -85,20 +102,37 @@ void StaticBakeCaptureFlush(Interpreter* gfx);
 // display list that opened it has returned.
 void StaticBakeOnEndDl(Interpreter* gfx);
 
-// Opcode whitelist. Anything not on it aborts the bake in progress.
-void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode);
+// Opcode whitelist, plus a guard on the operand: anything not on the list, or a display list,
+// vertex or texture reached through a segment, aborts the bake in progress. w1 is the command's
+// second word.
+void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode, uintptr_t w1);
 
-// Material-level whitelist, from GfxSpTri1: the recorder can only reproduce untextured,
-// non-grayscale materials whose fog (if any) it is able to recompute in the vertex shader.
-// cullCode is a StaticBakeCull value - the CPU cull decision the recording is skipping, which the
-// replay hands to the rasterizer instead. shadeMask has bit j set when colour input j is SHADE,
-// the input a lit vertex records its normal in.
-void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, bool useGrayscale,
-                            bool usedTexture0, bool usedTexture1, uint8_t cullCode, uint8_t shadeMask);
+// What GfxSpTri1 knows about the material a triangle is drawn with, for the recorder's
+// material-level whitelist.
+struct StaticBakeMaterial {
+    bool useFog;
+    bool useBlendColor;
+    bool useGrayscale;
+    // Texture slots the combiner reads, i.e. the ones the interpreter imported for this triangle.
+    bool combTextures[2];
+    // An HD mask or blend texture rides behind a slot (SHADER_FIRST_MASK_TEXTURE on).
+    bool maskedOrBlended;
+    // A StaticBakeCull value - the CPU cull decision the recording is skipping, which the replay
+    // hands to the rasterizer instead.
+    uint8_t cullCode;
+    // Bit j set when colour input j is SHADE, the input a lit vertex records its normal in.
+    uint8_t shadeMask;
+};
+
+// Material-level whitelist, from GfxSpTri1: the recorder can only reproduce non-grayscale
+// materials whose fog (if any) it can recompute in the vertex shader, and whose textures really
+// were imported and uploaded.
+void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& material);
 
 // Refuse the bake in progress, for something met outside the opcode and material checks - from
-// GfxSpVertex, a lit vertex using lighting the replay shader does not model. The display list
-// finishes its walk and is then interpreted for good. No-op when nothing is recording.
+// GfxSpVertex, a lit vertex using lighting the replay shader does not model; from ImportTexture, a
+// texture that cannot be held. The display list finishes its walk and is then interpreted for
+// good. No-op when nothing is recording.
 void StaticBakeAbort(Interpreter* gfx, const char* reason);
 
 // Safety net: a display list that never returns would otherwise leave recording armed across

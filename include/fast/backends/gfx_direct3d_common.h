@@ -72,6 +72,21 @@ struct ShaderProgramD3D11 {
     uint8_t numInputs;
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
+    // Whether the pixel stage was generated with three-point filtering, which is what makes it read
+    // PerDrawCB. Fixed at creation from the filter mode then in force; a later SetTextureFilter
+    // does not rebuild programs, so the mode now and the program can disagree.
+    bool threePointFiltering;
+};
+
+// A texture a baked draw holds (HoldStaticTexture): the GPU objects, and the three-point filter's
+// inputs copied from the texture-cache slot at the moment of the hold.
+struct StaticTextureHoldDX11 {
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+    uint32_t width;
+    uint32_t height;
+    bool linearFiltering;
+    uint32_t refs; // 0 = a free slot
 };
 
 class GfxWindowBackendDXGI;
@@ -131,9 +146,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void DeleteStaticBuffer(uint32_t bufferId) override;
     bool PrepareStaticShader(struct ShaderProgram* prg, uint8_t shadeMask) override;
     uint8_t GetShaderNumFloats(struct ShaderProgram* prg) override;
-    void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
-                             uint8_t shadeMask, const StaticBakeUniforms& uniforms, uint8_t cullMode,
-                             bool zmodeDecal) override;
+    uint32_t HoldStaticTexture(int slot) override;
+    void ReleaseStaticTexture(uint32_t handle) override;
+    void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -156,6 +171,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Bind a rasterizer that culls the way the RSP asked, for one baked draw. Invalidates the
     // interpreted path's rasterizer memo so it rebinds its own (cull-none) state afterwards.
     void ApplyStaticRasterState(uint8_t cullMode, bool zmodeDecal);
+    // Upload PerDrawCB / PerPrimDepthCB when what the GPU holds is not what the pixel stage should
+    // read. Shared by both draw paths, so each sees the other's uploads.
+    void UploadPerDrawCb();
+    void ApplyPrimDepthCb();
+    // Bind a baked draw's held textures, samplers and three-point inputs for the twin's used slots.
+    void BindStaticTextures(const StaticBakeDraw& draw, const struct ShaderProgramD3D11* variant);
     // The transform-enabled twin of a program, compiled on first use, lighting the colour inputs
     // in shadeMask. Null if shadeMask names an input the program lacks, if the generated HLSL did
     // not carry the markers the patch needs (see StaticBakePatchSource), or if it did not compile.
@@ -189,7 +210,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 #endif
 
     PerFrameCB mPerFrameCbData;
+    // The three-point inputs of the textures bound right now, slot by slot. Both draw paths write the
+    // slots they bind, so it always describes what is bound, whichever path bound it.
     PerDrawCB mPerDrawCbData;
+    // What mPerDrawCb holds on the GPU, so an upload is skipped when nothing changed.
+    PerDrawCB mPerDrawCbGpu = {};
+    bool mPerDrawCbGpuValid = false;
     PerPrimDepthCB mPerPrimDepthCbData;
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
@@ -208,6 +234,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Rasterizer states for baked draws, indexed cullMode * 2 + zmodeDecal. Built on demand and
     // kept, because a baked draw binds one every frame.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mStaticRasterizers[6];
+    // Textures held by baked draws (HoldStaticTexture). Index 0 is never handed out. Refcounted and
+    // deduplicated through mStaticTextureIndex, keyed on (view, sampler, linear filter), so a room
+    // that draws one texture in 40 batches holds it once, and a handle is equal to another exactly
+    // when it binds the same view and sampler and filters the same way.
+    std::vector<StaticTextureHoldDX11> mStaticTextures;
+    std::map<std::tuple<void*, void*, bool>, uint32_t> mStaticTextureIndex;
 
     std::vector<struct TextureData> mTextures;
     int mCurrentTile;

@@ -5,6 +5,7 @@
 #include "ship/controller/controldeck/ControlDeck.h"
 #include "ship/config/ConsoleVariable.h"
 #include "fast/interpreter.h"
+#include "fast/StaticMeshCache.h"
 #include "fast/backends/gfx_sdl.h"
 #include "fast/backends/gfx_dxgi.h"
 #include "fast/backends/gfx_opengl.h"
@@ -162,7 +163,14 @@ void Fast3dWindow::InitWindowManager() {
 }
 
 void Fast3dWindow::SetTextureFilter(FilteringMode filteringMode) {
-    mInterpreter->GetCurrentRenderingAPI()->SetTextureFilter(filteringMode);
+    GfxRenderingAPI* rapi = mInterpreter->GetCurrentRenderingAPI();
+    // A baked draw holds the sampler it was recorded with, whose filter came from the mode then in
+    // force, so a mode change has to re-record the bakes. The texture-cache clear below does not
+    // reach them: they hold their own textures (fast/StaticMeshCache.h).
+    if (rapi->GetTextureFilter() != filteringMode) {
+        StaticBakeInvalidateAll();
+    }
+    rapi->SetTextureFilter(filteringMode);
 }
 
 void Fast3dWindow::EnableSRGBMode() {

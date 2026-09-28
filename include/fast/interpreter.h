@@ -205,6 +205,11 @@ struct TextureCacheValue {
     // The frame that last bound this entry, as PerfCounters::frames + 1 so a fresh (zeroed) entry
     // never matches. Feeds the per-frame working-set counter; nothing else reads it.
     uint64_t used_in_frame;
+    // Whether the miss that created this entry really uploaded a texture. Several import paths
+    // return without uploading, and the entry then binds whatever its reused id held before. Only
+    // the static bake reads it (a recording refuses such an entry rather than freezing it), and it
+    // is only set on a backend that counts uploads (GfxRenderingAPI::TexturesUploaded).
+    bool uploaded;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };

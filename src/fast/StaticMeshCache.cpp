@@ -2,6 +2,7 @@
 
 #ifdef ENABLE_STATIC_BAKE
 
+#include <algorithm>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -22,22 +23,33 @@ enum class BakeState : uint8_t {
     Rejected, // the recorder met something it cannot reproduce; interpreted forever
 };
 
-// One replayed draw call: a contiguous run of the persistent buffer that shares a program and a
-// render state. The 256-triangle cap that breaks the interpreter's batches is a property of its
-// staging buffer, not of the geometry, so consecutive captured flushes with identical state are
-// merged here - that is the difference between ~9 draws per room and ~289.
+// One replayed draw call: a contiguous run of the persistent buffer that shares a program, a render
+// state and its textures. The 256-triangle cap that breaks the interpreter's batches is a property
+// of its staging buffer, not of the geometry, so consecutive captured flushes with identical state
+// are merged here - that is the difference between ~9 draws per room and ~289.
+//
+// `gpu` is what the backend draws with: the program, the cull mode GfxSpTri1's CPU test would have
+// applied, the SHADE inputs the replay lights, the decal mode, and the draw's own held textures -
+// one reference per slot the program samples, released in ReleaseGpu. Its bufferId is filled in
+// once the room's buffer exists.
 struct BakedDraw {
-    size_t byteOffset;
-    size_t numTris;
-    ShaderProgram* prg;
+    StaticBakeDraw gpu;
     uint8_t numFloats;
     uint8_t depthTestAndMask;
-    uint8_t cull;      // StaticBakeCull - what GfxSpTri1's CPU cull test would have done
-    uint8_t shadeMask; // colour inputs that are SHADE, which the replay shader lights
-    bool decal;
     bool alphaBlend;
     uint16_t primDepth;
 };
+
+// Everything that has to match for a new capture to extend the previous draw instead of opening
+// one. Textures compare by hold handle, which is equal exactly when the view and the sampler are
+// the same objects - so two batches with one program but different textures, or one texture under
+// different wrap or filter settings, stay separate draws.
+bool SameDrawState(const BakedDraw& a, const BakedDraw& b) {
+    return a.gpu.prg == b.gpu.prg && a.gpu.shadeMask == b.gpu.shadeMask && a.gpu.cullMode == b.gpu.cullMode &&
+           a.gpu.zmodeDecal == b.gpu.zmodeDecal && a.gpu.textures[0] == b.gpu.textures[0] &&
+           a.gpu.textures[1] == b.gpu.textures[1] && a.numFloats == b.numFloats &&
+           a.depthTestAndMask == b.depthTestAndMask && a.alphaBlend == b.alphaBlend && a.primDepth == b.primDepth;
+}
 
 struct Entry {
     BakeState state = BakeState::Unbaked;
@@ -68,10 +80,15 @@ const char* sAbortReason = nullptr;
 uint8_t sRecordCull = 0xFF;
 uint8_t sRecordShadeMask = 0xFF;
 
-// Opcodes the recorder understands. Anything else - a matrix load, a segment write, a texture
-// load, a branch_z - means the display list is doing something the replay could not reproduce,
-// so the bake is abandoned for good rather than guessed at. Indexed by the raw opcode byte;
-// values are F3DEX2's, which is what every compiled-in custom scene emits.
+// Opcodes the recorder understands. Anything else - a matrix load, a segment write, a branch_z -
+// means the display list is doing something the replay could not reproduce, so the bake is
+// abandoned for good rather than guessed at. Indexed by the raw opcode byte; values are F3DEX2's,
+// which is what every compiled-in custom scene emits.
+//
+// The texture loads run as normal while recording: they only stage RDP state, and the triangles
+// after them import and bind the texture exactly as a live frame would, which is what the capture
+// then holds. They are exactly what our scenes emit (sturdy-bassoon#142 step 0): gsDPLoadTextureBlock
+// is FD F5 E6 F3 E7 F5 F2, and Fast64's CI4 material adds F0.
 bool sOpcodeAllowed[256] = {};
 bool sOpcodeTableBuilt = false;
 
@@ -87,9 +104,9 @@ void BuildOpcodeTable() {
         0x05, // G_TRI1
         0x06, // G_TRI2
         0x07, // G_QUAD
-        0xd7, // G_TEXTURE     (scaling factors only - no texture is loaded)
+        0xd7, // G_TEXTURE     (scaling factors and the tile to use)
         0xd9, // G_GEOMETRYMODE
-        0xde, // G_DL          (a nested plain display list)
+        0xde, // G_DL          (a nested plain display list; not through a segment - see the guard)
         0xdf, // G_ENDDL
         0xe2, // G_SETOTHERMODE_L
         0xe3, // G_SETOTHERMODE_H
@@ -97,18 +114,37 @@ void BuildOpcodeTable() {
         0xe7, // G_RDPPIPESYNC
         0xe8, // G_RDPTILESYNC
         0xe9, // G_RDPFULLSYNC
+        0xf0, // G_LOADTLUT    (a palette; CI textures are expanded to RGBA at upload, so only here)
+        0xf2, // G_SETTILESIZE (a scroll changes it per frame, but reaches the list through a segment)
+        0xf3, // G_LOADBLOCK
+        0xf5, // G_SETTILE
         0xfa, // G_SETPRIMCOLOR
         0xfb, // G_SETENVCOLOR
         0xfc, // G_SETCOMBINE
+        0xfd, // G_SETTIMG     (not through a segment - see the guard)
     };
     for (uint8_t op : kAllowed) {
         sOpcodeAllowed[op] = true;
     }
 }
 
+void ReleaseTextures(const StaticBakeDraw& d) {
+    if (sRapi == nullptr) {
+        return;
+    }
+    for (uint32_t handle : d.textures) {
+        if (handle != 0) {
+            sRapi->ReleaseStaticTexture(handle);
+        }
+    }
+}
+
 void ReleaseGpu(Entry& e) {
     if (e.buffer != 0 && sRapi != nullptr) {
         sRapi->DeleteStaticBuffer(e.buffer);
+    }
+    for (const BakedDraw& d : e.draws) {
+        ReleaseTextures(d.gpu);
     }
     e.buffer = 0;
     e.draws.clear();
@@ -153,9 +189,7 @@ void BeginRecording(Interpreter* gfx, const void* key, Entry& e) {
     gfx->mRsp->MP_matrix[2][2] = 1.0f;
     gfx->mRsp->MP_matrix[3][3] = 1.0f;
 
-    e.staging.clear();
-    e.draws.clear();
-    e.totalTris = 0;
+    ReleaseGpu(e); // an UNBAKED entry holds nothing, but if it ever did its textures would leak here
 
     sRecording = &e;
     sRecordingKey = key;
@@ -242,25 +276,30 @@ void Replay(Interpreter* gfx, Entry& e) {
             gfx->mRapi->SetDepthTestAndMask(depthTest, depthMask);
             gfx->mRenderingState.depth_test_and_mask = d.depthTestAndMask;
         }
-        if (d.decal != gfx->mRenderingState.decal_mode) {
-            gfx->mRapi->SetZmodeDecal(d.decal);
-            gfx->mRenderingState.decal_mode = d.decal;
+        if (d.gpu.zmodeDecal != gfx->mRenderingState.decal_mode) {
+            gfx->mRapi->SetZmodeDecal(d.gpu.zmodeDecal);
+            gfx->mRenderingState.decal_mode = d.gpu.zmodeDecal;
         }
         if (d.alphaBlend != gfx->mRenderingState.alpha_blend) {
             gfx->mRapi->SetUseAlpha(d.alphaBlend);
             gfx->mRenderingState.alpha_blend = d.alphaBlend;
         }
         gfx->mRapi->SetCurrentPrimDepth((float)d.primDepth / 32767.0f);
-        gfx->mRapi->DrawStaticTriangles(e.buffer, d.byteOffset, d.numTris, d.prg, d.shadeMask, u, d.cull, d.decal);
+        gfx->mRapi->DrawStaticTriangles(d.gpu, u);
 
         gPerfCounters.draws++;
         gPerfCounters.drawsBaked++;
-        gPerfCounters.trisBaked += d.numTris;
+        gPerfCounters.trisBaked += d.gpu.numTris;
     }
 
     // The backend has just bound a shader and a vertex buffer the interpreter knows nothing
     // about. Clearing the memo makes the next interpreted triangle re-run its own binding path;
     // without it the corruption shows up in whatever draws *after* a baked room, not in the room.
+    //
+    // Textures need nothing here. The draws bound their held textures straight to the GPU and left
+    // the backend's own memo saying so, so the next interpreted draw rebinds any slot that differs.
+    // The interpreter's side - mRenderingState.mTextures and the cache id each slot names - was
+    // never touched, and still describes the texture the interpreter will ask for.
     gfx->mRenderingState.mShaderProgram = nullptr;
 }
 
@@ -290,12 +329,12 @@ void FinishRecording(Interpreter* gfx) {
     // uploaded rather than diagnosed from a corrupt frame.
     if (!rejected) {
         for (const BakedDraw& d : e->draws) {
-            if (!gfx->mRapi->PrepareStaticShader(d.prg, d.shadeMask)) {
+            if (!gfx->mRapi->PrepareStaticShader(d.gpu.prg, d.gpu.shadeMask)) {
                 rejected = true;
                 reason = "no transform-enabled shader variant";
                 break;
             }
-            const uint8_t expected = gfx->mRapi->GetShaderNumFloats(d.prg);
+            const uint8_t expected = gfx->mRapi->GetShaderNumFloats(d.gpu.prg);
             if (expected != d.numFloats) {
                 SPDLOG_ERROR("[staticbake] stride mismatch: recorded {} floats/vertex, shader expects {}", d.numFloats,
                              expected);
@@ -324,9 +363,27 @@ void FinishRecording(Interpreter* gfx) {
         return;
     }
 
+    // The textured draws and the distinct textures they hold, for the log: a room that loads textures
+    // and reports 0 here is not drawing them.
+    size_t texturedDraws = 0;
+    std::vector<uint32_t> held;
+    for (BakedDraw& d : e->draws) {
+        d.gpu.bufferId = e->buffer;
+        bool textured = false;
+        for (uint32_t handle : d.gpu.textures) {
+            if (handle != 0) {
+                textured = true;
+                if (std::find(held.begin(), held.end(), handle) == held.end()) {
+                    held.push_back(handle);
+                }
+            }
+        }
+        texturedDraws += textured ? 1 : 0;
+    }
+
     e->state = BakeState::Baked;
-    SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB", key, e->draws.size(), e->totalTris,
-                (e->staging.size() * sizeof(float)) / 1024);
+    SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures", key,
+                e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws, held.size());
     e->staging.clear();
     e->staging.shrink_to_fit();
 
@@ -351,7 +408,7 @@ bool StaticBakeIsEnabled() {
 }
 
 void StaticBakeRegister(const void* displayList) {
-    if (!sEnabled || displayList == nullptr) {
+    if (displayList == nullptr) {
         return;
     }
     sEntries.emplace(displayList, Entry{});
@@ -477,30 +534,43 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     e->staging.insert(e->staging.end(), gfx->mBufVbo, gfx->mBufVbo + gfx->mBufVboLen);
     e->totalTris += gfx->mBufVboNumTris;
 
+    BakedDraw d = {};
+    d.gpu.byteOffset = byteOffset;
+    d.gpu.numTris = gfx->mBufVboNumTris;
+    d.gpu.prg = prg;
+    d.gpu.shadeMask = shadeMask;
+    d.gpu.cullMode = cull;
+    d.gpu.zmodeDecal = decal;
+    d.numFloats = (uint8_t)floatsPerVertex;
+    d.depthTestAndMask = depthTestAndMask;
+    d.alphaBlend = alphaBlend;
+    d.primDepth = primDepth;
+
+    // Hold the textures the batch was drawn with, for every slot the program samples. What the
+    // backend has bound right now is this batch's: GfxSpTri1 flushes before it imports a texture
+    // and before it changes a sampler. The hold copies what it needs rather than pointing into the
+    // cache or at mRdp, both of which have moved on to the next batch or will. A slot the program
+    // samples but the combiner does not read (2-cycle marks TEXEL1 used whenever TEXEL0 is) is held
+    // as bound, even if that is nothing, which is what the interpreter would draw with; the slots the
+    // combiner does read were checked in StaticBakeNoteMaterial.
+    uint8_t numInputs = 0;
+    bool usedTextures[STATIC_BAKE_TEXTURE_SLOTS] = {};
+    gfx->mRapi->ShaderGetInfo(prg, &numInputs, usedTextures);
+    for (int i = 0; i < STATIC_BAKE_TEXTURE_SLOTS; i++) {
+        d.gpu.textures[i] = usedTextures[i] ? gfx->mRapi->HoldStaticTexture(i) : 0;
+    }
+
     // Merge into the previous draw when nothing that matters changed. Without this the
     // 256-triangle staging cap alone would give a 74k-triangle room ~289 draw calls.
     if (!e->draws.empty()) {
         BakedDraw& prev = e->draws.back();
-        if (prev.prg == prg && prev.numFloats == floatsPerVertex && prev.depthTestAndMask == depthTestAndMask &&
-            prev.cull == cull && prev.shadeMask == shadeMask && prev.decal == decal && prev.alphaBlend == alphaBlend &&
-            prev.primDepth == primDepth &&
-            prev.byteOffset + prev.numTris * 3 * floatsPerVertex * sizeof(float) == byteOffset) {
-            prev.numTris += gfx->mBufVboNumTris;
+        if (SameDrawState(prev, d) &&
+            prev.gpu.byteOffset + prev.gpu.numTris * 3 * floatsPerVertex * sizeof(float) == byteOffset) {
+            prev.gpu.numTris += d.gpu.numTris;
+            ReleaseTextures(d.gpu); // the same handles prev already holds, one reference too many
             return;
         }
     }
-
-    BakedDraw d = {};
-    d.byteOffset = byteOffset;
-    d.numTris = gfx->mBufVboNumTris;
-    d.prg = prg;
-    d.numFloats = (uint8_t)floatsPerVertex;
-    d.depthTestAndMask = depthTestAndMask;
-    d.cull = cull;
-    d.shadeMask = shadeMask;
-    d.decal = decal;
-    d.alphaBlend = alphaBlend;
-    d.primDepth = primDepth;
     e->draws.push_back(d);
 }
 
@@ -510,8 +580,23 @@ void StaticBakeOnEndDl(Interpreter* gfx) {
     }
 }
 
-void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode) {
-    if (!sOpcodeAllowed[(uint8_t)opcode]) {
+void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode, uintptr_t w1) {
+    // A segmented operand is resolved through mSegmentPointers at record time, and a segment is how
+    // OoT feeds a display list something that changes every frame: vanilla's texture scrolls
+    // (Gfx_TexScroll, a G_SETTILESIZE behind a segment - which the whitelist now lets through) and
+    // its animated materials. A recording would freeze whichever frame it happened on. Odd = segmented
+    // is SoH's convention (Interpreter::SegAddr). No compiled-in custom scene does this today; the
+    // guard is there so that nothing that does can bake silently.
+    constexpr uint8_t kOpVtx = 0x01;     // G_VTX
+    constexpr uint8_t kOpDl = 0xde;      // G_DL
+    constexpr uint8_t kOpSetTImg = 0xfd; // G_SETTIMG
+    const uint8_t op = (uint8_t)opcode;
+    if ((op == kOpDl || op == kOpSetTImg || op == kOpVtx) && (w1 & 1) != 0) {
+        AbortRecording(gfx, op == kOpDl        ? "nested display list reached through a segment"
+                            : op == kOpSetTImg ? "texture image reached through a segment"
+                                               : "vertices reached through a segment");
+    }
+    if (!sOpcodeAllowed[op]) {
         AbortRecording(gfx, "display list used an opcode the recorder does not understand");
         // Drop whatever object-space geometry is already buffered and hand the rest of the list
         // back to the normal path, correct matrix and all. One frame of this room draws short;
@@ -530,22 +615,40 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode) {
     }
 }
 
-void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, bool useGrayscale, bool usedTexture0,
-                            bool usedTexture1, uint8_t cullCode, uint8_t shadeMask) {
-    // Each of these would need its own replay-side handling that this prototype does not have:
-    // textures need the sampler bindings restored, and grayscale and blend-colour fog carry
-    // per-frame RDP colours in the vertex payload.
-    if (usedTexture0 || usedTexture1) {
-        AbortRecording(gfx, "textured material (Stage 1 is textureless-only)");
-    } else if (useGrayscale) {
+void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& m) {
+    static_assert(sizeof(m.combTextures) / sizeof(m.combTextures[0]) == STATIC_BAKE_TEXTURE_SLOTS,
+                  "StaticBakeMaterial names one flag per texture slot a baked draw can bind");
+
+    // A texture slot the combiner reads has to be one the replay can hold: an entry the import
+    // really uploaded (a null entry or a non-upload would bind whatever the reused id held before).
+    // GfxSpTri1 has just imported these, so this is checked against the live state, per triangle -
+    // which is per batch, since the interpreter flushes before any import.
+    bool textureUnholdable = false;
+    for (int i = 0; i < STATIC_BAKE_TEXTURE_SLOTS; i++) {
+        if (m.combTextures[i]) {
+            const TextureCacheNode* node = gfx->mRenderingState.mTextures[i];
+            if (node == nullptr || !node->second.uploaded) {
+                textureUnholdable = true;
+            }
+        }
+    }
+
+    // Each of these would need its own replay-side handling that the bake does not have: HD mask and
+    // blend textures bind four more slots, and grayscale and blend-colour fog carry per-frame RDP
+    // colours in the vertex payload.
+    if (m.maskedOrBlended) {
+        AbortRecording(gfx, "masked or blended (HD) texture");
+    } else if (textureUnholdable) {
+        AbortRecording(gfx, "a texture slot the combiner reads uploaded nothing");
+    } else if (m.useGrayscale) {
         AbortRecording(gfx, "grayscale material");
-    } else if (useBlendColor) {
+    } else if (m.useBlendColor) {
         AbortRecording(gfx, "blend-colour fog material");
     } else if ((gfx->mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) != 0) {
         // MirroredWorld flips the winding test per frame; a recording would freeze whichever way
         // it was pointing on the frame it happened to be made.
         AbortRecording(gfx, "G_EX_INVERT_CULLING active");
-    } else if (useFog != ((gfx->mRsp->geometry_mode & G_FOG) != 0)) {
+    } else if (m.useFog != ((gfx->mRsp->geometry_mode & G_FOG) != 0)) {
         // GfxSpVertex stores the fog factor in the vertex's alpha channel, which is view-dependent
         // and therefore garbage in an object-space recording. That is fine when the material also
         // consumes it as fog, because the patched vertex shader recomputes it - but only then. A
@@ -556,7 +659,7 @@ void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, b
     }
 
     // GfxSpTri1 drops every triangle under G_CULL_BOTH; rejecting is simpler than modelling it.
-    if (cullCode == STATIC_BAKE_CULL_BOTH) {
+    if (m.cullCode == STATIC_BAKE_CULL_BOTH) {
         AbortRecording(gfx, "G_CULL_BOTH material");
     }
 
@@ -568,11 +671,11 @@ void StaticBakeNoteMaterial(Interpreter* gfx, bool useFog, bool useBlendColor, b
     // different inputs, and the interpreter does not flush between them (the program did not
     // change; only which input is fed the vertex colour did). The replay shader lights a fixed
     // input, so one baked draw can only have one mask.
-    const uint8_t cull = cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : cullCode;
-    if (cull != sRecordCull || shadeMask != sRecordShadeMask) {
+    const uint8_t cull = m.cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : m.cullCode;
+    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask) {
         gfx->Flush(); // captures what is buffered under the *previous* mode and mask
         sRecordCull = cull;
-        sRecordShadeMask = shadeMask;
+        sRecordShadeMask = m.shadeMask;
     }
 }
 

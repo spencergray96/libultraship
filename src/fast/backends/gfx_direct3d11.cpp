@@ -400,11 +400,12 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     size_t numFloats;
 
-    auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+    const bool threePoint = mCurrentFilterMode == FILTER_THREE_POINT;
+    auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false, threePoint, mSrgbMode);
 
     struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
     BuildShaderProgram(prg, shader, cc_features, shader_id0, shader_id1, numFloats);
+    prg->threePointFiltering = threePoint;
 
     return (struct ShaderProgram*)(mShaderProgram = prg);
 }
@@ -614,6 +615,7 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
 
     ThrowIfFailed(mDevice->CreateShaderResourceView(texture_data->texture.Get(), nullptr,
                                                     texture_data->resource_view.ReleaseAndGetAddressOf()));
+    mTexturesUploaded++;
 }
 
 void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
@@ -791,6 +793,31 @@ void GfxRenderingAPIDX11::ApplyStaticRasterState(uint8_t cullMode, bool zmodeDec
     mLastZmodeDecal = -1;
 }
 
+void GfxRenderingAPIDX11::UploadPerDrawCb() {
+    if (mPerDrawCbGpuValid && memcmp(&mPerDrawCbGpu, &mPerDrawCbData, sizeof(PerDrawCB)) == 0) {
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+    mContext->Map(mPerDrawCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    memcpy(ms.pData, &mPerDrawCbData, sizeof(PerDrawCB));
+    mContext->Unmap(mPerDrawCb.Get(), 0);
+    mPerDrawCbGpu = mPerDrawCbData;
+    mPerDrawCbGpuValid = true;
+}
+
+void GfxRenderingAPIDX11::ApplyPrimDepthCb() {
+    if (mPrimDepthDirty) {
+        mPerPrimDepthCbData.prim_depth = mCurrentPrimDepth;
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+        mContext->Map(mPerPrimDepthCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        memcpy(ms.pData, &mPerPrimDepthCbData, sizeof(PerPrimDepthCB));
+        mContext->Unmap(mPerPrimDepthCb.Get(), 0);
+        mPrimDepthDirty = false;
+    }
+}
+
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
     ApplyDepthAndRasterState();
@@ -826,23 +853,11 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 
     // Set per-draw constant buffer
     if (textures_changed) {
-        D3D11_MAPPED_SUBRESOURCE ms;
-        ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-        mContext->Map(mPerDrawCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-        memcpy(ms.pData, &mPerDrawCbData, sizeof(PerDrawCB));
-        mContext->Unmap(mPerDrawCb.Get(), 0);
+        UploadPerDrawCb();
     }
 
     // G_ZS_PRIM: upload prim_depth cbuffer when it changed
-    if (mPrimDepthDirty) {
-        mPerPrimDepthCbData.prim_depth = mCurrentPrimDepth;
-        D3D11_MAPPED_SUBRESOURCE ms;
-        ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-        mContext->Map(mPerPrimDepthCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-        memcpy(ms.pData, &mPerPrimDepthCbData, sizeof(PerPrimDepthCB));
-        mContext->Unmap(mPerPrimDepthCb.Get(), 0);
-        mPrimDepthDirty = false;
-    }
+    ApplyPrimDepthCb();
 
     // Set vertex buffer data
 
@@ -1013,11 +1028,14 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
     CCFeatures cc_features;
     gfx_cc_get_features(base->shader_id0, base->shader_id1, &cc_features);
 
+    // Filtered the way its base was, not the way the current mode says: a SetTextureFilter after the
+    // base was built does not rebuild it, and the twin has to draw what the base would have drawn.
     size_t numFloats;
-    std::string source = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                          mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+    std::string source =
+        gfx_direct3d_common_build_shader(numFloats, cc_features, false, base->threePointFiltering, mSrgbMode);
 
     struct ShaderProgramD3D11* prg = &mStaticShaderPool[key];
+    prg->threePointFiltering = base->threePointFiltering;
     if ((shadeMask >> cc_features.numInputs) != 0) {
         // The recorder named a colour input this program does not have: a recording bug, not a
         // template one, so there is no vertex stage worth dumping.
@@ -1115,19 +1133,122 @@ uint8_t GfxRenderingAPIDX11::GetShaderNumFloats(struct ShaderProgram* prg) {
     return prg == nullptr ? 0 : ((struct ShaderProgramD3D11*)prg)->numFloats;
 }
 
-void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris,
-                                              struct ShaderProgram* prg, uint8_t shadeMask,
-                                              const StaticBakeUniforms& uniforms, uint8_t cullMode, bool zmodeDecal) {
-    if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || numTris == 0) {
+// Why a reference to the objects is enough: UploadTexture and SetSamplerParameters never write into
+// an existing texture, view or sampler - they create new ones into the id's slot
+// (ReleaseAndGetAddressOf / Reset). So once a baked draw holds the objects, whatever the texture
+// cache later does to that id replaces the cache's reference and leaves ours alone. The cost is VRAM
+// the cache no longer counts: a texture the cache has let go stays resident while a bake holds it.
+uint32_t GfxRenderingAPIDX11::HoldStaticTexture(int slot) {
+    if (slot < 0 || slot >= STATIC_BAKE_TEXTURE_SLOTS) {
+        return 0;
+    }
+    const uint32_t id = mCurrentTextureIds[slot];
+    if (id >= mTextures.size() || !mTextures[id].resource_view) {
+        return 0;
+    }
+    const TextureData& td = mTextures[id];
+    // The filter flag is part of what a hold is, not just the objects: under three-point filtering
+    // every sampler is a point sampler, and D3D11 hands back the same object for the same
+    // description, so a point and a bilinear batch of one texture share both objects and differ only
+    // in the flag the three-point shader branches on.
+    const auto key = std::make_tuple((void*)td.resource_view.Get(), (void*)td.sampler_state.Get(), td.linear_filtering);
+    auto it = mStaticTextureIndex.find(key);
+    if (it != mStaticTextureIndex.end()) {
+        mStaticTextures[it->second].refs++;
+        return it->second;
+    }
+
+    if (mStaticTextures.empty()) {
+        mStaticTextures.emplace_back(); // handle 0 is reserved for "nothing bound"
+    }
+    uint32_t handle = 0;
+    for (uint32_t i = 1; i < mStaticTextures.size(); i++) {
+        if (mStaticTextures[i].refs == 0) {
+            handle = i;
+            break;
+        }
+    }
+    if (handle == 0) {
+        mStaticTextures.emplace_back();
+        handle = (uint32_t)(mStaticTextures.size() - 1);
+    }
+    StaticTextureHoldDX11& hold = mStaticTextures[handle];
+    hold.view = td.resource_view;
+    hold.sampler = td.sampler_state;
+    hold.width = td.width;
+    hold.height = td.height;
+    hold.linearFiltering = td.linear_filtering;
+    hold.refs = 1;
+    mStaticTextureIndex.emplace(key, handle);
+    return handle;
+}
+
+void GfxRenderingAPIDX11::ReleaseStaticTexture(uint32_t handle) {
+    if (handle == 0 || handle >= mStaticTextures.size() || mStaticTextures[handle].refs == 0) {
         return;
     }
-    struct ShaderProgramD3D11* variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)prg, shadeMask);
+    StaticTextureHoldDX11& hold = mStaticTextures[handle];
+    if (--hold.refs != 0) {
+        return;
+    }
+    mStaticTextureIndex.erase(std::make_tuple((void*)hold.view.Get(), (void*)hold.sampler.Get(), hold.linearFiltering));
+    hold.view.Reset();
+    hold.sampler.Reset();
+}
+
+// The interpreted path's binding loop (DrawTriangles), fed from the draw's held objects instead of
+// the texture cache's current ids. The memos are left saying what is really bound, so the next
+// interpreted draw rebinds exactly the slots whose texture differs - and PerDrawCB's shadow is
+// written the same way, so it keeps describing whatever is bound whichever path bound it.
+void GfxRenderingAPIDX11::BindStaticTextures(const StaticBakeDraw& draw, const struct ShaderProgramD3D11* variant) {
+    bool anyUsed = false;
+    for (int i = 0; i < STATIC_BAKE_TEXTURE_SLOTS; i++) {
+        if (!variant->usedTextures[i]) {
+            continue;
+        }
+        anyUsed = true;
+        const uint32_t handle = draw.textures[i];
+        const StaticTextureHoldDX11* hold =
+            (handle != 0 && handle < mStaticTextures.size() && mStaticTextures[handle].refs != 0)
+                ? &mStaticTextures[handle]
+                : nullptr;
+        ID3D11ShaderResourceView* view = hold != nullptr ? hold->view.Get() : nullptr;
+        ID3D11SamplerState* sampler = hold != nullptr ? hold->sampler.Get() : nullptr;
+        if (mLastResourceViews[i].Get() != view) {
+            mContext->PSSetShaderResources(i, 1, &view);
+            mLastResourceViews[i] = view;
+        }
+        mContext->PSSetSamplers(i, 1, &sampler);
+        mLastSamplerStates[i] = sampler;
+
+        PerDrawCB::Texture& cb = mPerDrawCbData.mTextures[i];
+        cb.width = hold != nullptr ? hold->width : 0;
+        cb.height = hold != nullptr ? hold->height : 0;
+        cb.linear_filtering = hold != nullptr && hold->linearFiltering ? 1 : 0;
+    }
+    // Uploaded whether or not this program reads it: the next interpreted draw decides by the current
+    // filter mode rather than its program's, and skips the upload when its view is unchanged. The
+    // compare inside makes an unchanged buffer free.
+    if (anyUsed) {
+        UploadPerDrawCb();
+    }
+}
+
+void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) {
+    const uint32_t bufferId = draw.bufferId;
+    if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || draw.numTris == 0) {
+        return;
+    }
+    struct ShaderProgramD3D11* variant =
+        LookupOrCreateStaticShader((struct ShaderProgramD3D11*)draw.prg, draw.shadeMask);
     if (variant == nullptr) {
         return;
     }
 
     ApplyDepthAndRasterState();
-    ApplyStaticRasterState(cullMode, zmodeDecal);
+    ApplyStaticRasterState(draw.cullMode, draw.zmodeDecal);
+    BindStaticTextures(draw, variant);
+    ApplyPrimDepthCb();
 
     if (!mStaticBakeCb) {
         D3D11_BUFFER_DESC desc;
@@ -1166,7 +1287,7 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffs
     mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 1, mStaticBakeCb.GetAddressOf());
 
     const uint32_t stride = variant->numFloats * sizeof(float);
-    const uint32_t offset = (uint32_t)byteOffset;
+    const uint32_t offset = (uint32_t)draw.byteOffset;
     mContext->IASetVertexBuffers(0, 1, mStaticBuffers[bufferId].GetAddressOf(), &stride, &offset);
     mContext->IASetInputLayout(variant->input_layout.Get());
     mContext->VSSetShader(variant->vertex_shader.Get(), 0, 0);
@@ -1178,11 +1299,12 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(uint32_t bufferId, size_t byteOffs
         mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
 
-    mContext->Draw((UINT)(numTris * 3), 0);
+    mContext->Draw((UINT)(draw.numTris * 3), 0);
 
     // Everything this draw bound behind the interpreted path's back has to be forgotten, or the
     // next interpreted DrawTriangles will skip a rebind it actually needs and read the wrong
     // buffer through the wrong shader. Stride 0 is not a legal stride, so it reads as "unknown".
+    // (The texture memos need no reset: BindStaticTextures left them true.)
     mLastVertexBufferStride = 0;
     mLastShaderProgram = nullptr;
     mLastBlendState.Reset();

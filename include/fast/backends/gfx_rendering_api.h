@@ -61,6 +61,25 @@ struct StaticBakeUniforms {
     float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
 };
 
+// Texture slots a baked draw can bind: TEXEL0 and TEXEL1. The HD mask and blend slots behind them
+// (SHADER_FIRST_MASK_TEXTURE on) are refused at record time, so a baked draw never needs them.
+constexpr int STATIC_BAKE_TEXTURE_SLOTS = 2;
+
+// One replayed draw, as the backend needs it. Everything that is per draw rather than per room
+// travels in here; the per-room camera, fog and lights are StaticBakeUniforms.
+struct StaticBakeDraw {
+    uint32_t bufferId; // CreateStaticBuffer's handle for the room
+    size_t byteOffset; // where this draw's vertices start in that buffer
+    size_t numTris;
+    ShaderProgram* prg; // the interpreted program; the backend binds its transform-enabled twin
+    uint8_t shadeMask;  // colour inputs that are SHADE, which the twin lights
+    uint8_t cullMode;   // StaticBakeCull
+    bool zmodeDecal;
+    // HoldStaticTexture handles, one per slot the program samples, taken when the draw was recorded.
+    // 0 binds no texture to that slot.
+    uint32_t textures[STATIC_BAKE_TEXTURE_SLOTS];
+};
+
 // A hash function used to hash a: pair<float, float>
 struct hash_pair_ff {
     size_t operator()(const std::pair<float, float>& p) const {
@@ -151,16 +170,33 @@ class GfxRenderingAPI {
     virtual uint8_t GetShaderNumFloats(struct ShaderProgram* prg) {
         return 0;
     }
-    // One replayed draw. The caller has already applied depth/decal state through the normal
-    // setters; this binds the persistent buffer, the transform-enabled shader and the uniforms,
-    // draws, and leaves the backend's "currently bound" memo invalidated so the next interpreted
-    // draw rebinds from scratch.
-    virtual void DrawStaticTriangles(uint32_t bufferId, size_t byteOffset, size_t numTris, struct ShaderProgram* prg,
-                                     uint8_t shadeMask, const StaticBakeUniforms& uniforms, uint8_t cullMode,
-                                     bool zmodeDecal) {
+    // Take a reference to the texture and sampler bound to `slot` right now, for a baked draw to
+    // bind on replay. The reference is to the GPU objects themselves, not to a texture-cache id, so
+    // nothing the cache does afterwards - an eviction, an id handed to another texture, a full clear -
+    // can change what the baked draw samples. Holding the same objects twice returns the same handle
+    // with one more reference, so two handles compare equal exactly when they bind the same texture
+    // with the same sampler and the same filter flag. 0 means nothing is bound.
+    virtual uint32_t HoldStaticTexture(int slot) {
+        return 0;
+    }
+    virtual void ReleaseStaticTexture(uint32_t handle) {
+    }
+    // One replayed draw. The caller has already applied depth/decal/prim-depth state through the
+    // normal setters; this binds the persistent buffer, the transform-enabled shader, the draw's
+    // held textures and the uniforms, draws, and leaves the backend's "currently bound" memo true
+    // (or invalidated) so the next interpreted draw rebinds whatever it needs.
+    virtual void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) {
+    }
+
+    // Textures the backend has actually created through UploadTexture. The static bake compares it
+    // across a texture-cache miss to tell an import that uploaded from one that returned early and
+    // left the id holding its previous occupant's picture. Only backends that bake count.
+    uint64_t TexturesUploaded() const {
+        return mTexturesUploaded;
     }
 
   protected:
+    uint64_t mTexturesUploaded = 0;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

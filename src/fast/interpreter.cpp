@@ -1327,6 +1327,13 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     if (origAddr != nullptr && !importReplacement) {
         auto fbIt = mFbTextures.find((uintptr_t)origAddr);
         if (fbIt != mFbTextures.end()) {
+#ifdef ENABLE_STATIC_BAKE
+            // A framebuffer changes every frame, and this path leaves mRenderingState.mTextures[i]
+            // naming the previous texture - a bake would freeze the wrong one either way.
+            if (gStaticBakeRecording) {
+                StaticBakeAbort(this, "framebuffer texture");
+            }
+#endif
             Flush();
             mRapi->SelectTextureFb(fbIt->second);
             mRdp->textures_changed[i] = false;
@@ -1341,6 +1348,12 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         origAddr = mRdp->loaded_texture[otherTmem].addr;
         if (origAddr == nullptr) {
             SPDLOG_WARN("ImportTexture: null texture address for tile {} (both TMEM slots empty)", tile);
+#ifdef ENABLE_STATIC_BAKE
+            // Nothing is imported, so slot i keeps binding whatever it bound before.
+            if (gStaticBakeRecording) {
+                StaticBakeAbort(this, "texture import with both TMEM slots empty");
+            }
+#endif
             return;
         }
         SPDLOG_WARN("ImportTexture: tile {} TMEM slot {} empty, falling back to slot {}", tile, tmemIdex, otherTmem);
@@ -1375,6 +1388,23 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     if (TextureCacheLookup(i, key)) {
         return;
     }
+
+#ifdef ENABLE_STATIC_BAKE
+    // Record on the new entry whether this miss really reached the GPU. Every path below can return
+    // before uploading (the zero-size guard, an unsupported format, a decode that bails), and the
+    // entry would then keep binding its reused id's previous texture - which the interpreter draws
+    // too, but a recording would freeze. Set on the way out, whichever return is taken.
+    struct UploadNote {
+        TextureCacheNode* node;
+        GfxRenderingAPI* rapi;
+        uint64_t before;
+        ~UploadNote() {
+            if (node != nullptr) {
+                node->second.uploaded = rapi->TexturesUploaded() != before;
+            }
+        }
+    } uploadNote{ mRenderingState.mTextures[i], mRapi, mRapi->TexturesUploaded() };
+#endif
 
     // Guard against zero-sized textures that would cause divide-by-zero
     // or GPU API errors in UploadTexture.
@@ -2206,8 +2236,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 bake_shade_mask |= (uint8_t)(1 << j);
             }
         }
-        StaticBakeNoteMaterial(this, use_fog, use_blend_color, use_grayscale, usedTextures[0], usedTextures[1],
-                               bake_cull, bake_shade_mask);
+        StaticBakeMaterial bake_material = {};
+        bake_material.useFog = use_fog;
+        bake_material.useBlendColor = use_blend_color;
+        bake_material.useGrayscale = use_grayscale;
+        // The slots the combiner reads - the ones imported above, whose mRenderingState.mTextures
+        // entry is meaningful. The program can sample more (2-cycle marks TEXEL1 used whenever
+        // TEXEL0 is), but those are bound as the interpreter would bind them and never validated.
+        bake_material.combTextures[0] = comb->usedTextures[0];
+        bake_material.combTextures[1] = comb->usedTextures[1];
+        bake_material.maskedOrBlended = (cc_options & (SHADER_OPT(TEXEL0_MASK) | SHADER_OPT(TEXEL1_MASK) |
+                                                       SHADER_OPT(TEXEL0_BLEND) | SHADER_OPT(TEXEL1_BLEND))) != 0;
+        bake_material.cullCode = bake_cull;
+        bake_material.shadeMask = bake_shade_mask;
+        StaticBakeNoteMaterial(this, bake_material);
     }
 #endif
 
@@ -5016,7 +5058,7 @@ static void gfx_step() {
     // the bake for good rather than being guessed at. One predictable branch on a global outside
     // a recording, which is all but always.
     if (gStaticBakeRecording) {
-        StaticBakeOnOpcode(mInstance.lock().get(), opcode);
+        StaticBakeOnOpcode(mInstance.lock().get(), opcode, cmd->words.w1);
     }
 #endif
 
