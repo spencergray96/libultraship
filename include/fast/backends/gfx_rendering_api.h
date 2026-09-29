@@ -188,6 +188,17 @@ class GfxRenderingAPI {
     virtual void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) {
     }
 
+    // ---- Mipmaps for the host's own textures (sturdy-bassoon#146, fast/TextureMips.h). ----
+    // Set by the interpreter around one texture import: the next UploadTexture should build a mip
+    // chain. A backend that ignores it (every one but DX11 today) uploads one level, as before.
+    virtual void SetNextUploadMipmaps(bool mipmaps) {
+    }
+    // Uploads that really built more than one level: a texture that is not a power of two gets one
+    // level even when asked, and so does every texture on a backend that ignores the request.
+    uint64_t MippedUploads() const {
+        return mMippedUploads;
+    }
+
     // Textures the backend has actually created through UploadTexture. The static bake compares it
     // across a texture-cache miss to tell an import that uploaded from one that returned early and
     // left the id holding its previous occupant's picture. Only backends that bake count.
@@ -197,6 +208,7 @@ class GfxRenderingAPI {
 
   protected:
     uint64_t mTexturesUploaded = 0;
+    uint64_t mMippedUploads = 0;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

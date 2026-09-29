@@ -83,6 +83,7 @@ cbuffer PerDrawCB : register(b1) {
         uint width;
         uint height;
         bool linear_filtering;
+        uint mip_levels;
     } textures[2];
 }
 
@@ -95,6 +96,38 @@ float4 tex2D3PointFilter(in Texture2D tex, in SamplerState tSampler, in float2 t
     float4 c1 = TEX_OFFSET(tex, tSampler, texCoord, float2(offset.x - sign(offset.x), offset.y), texSize);
     float4 c2 = TEX_OFFSET(tex, tSampler, texCoord, float2(offset.x, offset.y - sign(offset.y)), texSize);
     return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
+}
+
+// Mipmapped textures (sturdy-bassoon#146). The same three-point filter, run on one level of the
+// chain: texSize is that level's size, so the three taps sit on that level's texels.
+float4 tex2D3PointFilterLevel(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize, in float level) {
+    float2 offset = frac(texCoord * texSize - float2(0.5, 0.5));
+    offset -= step(1.0, offset.x + offset.y);
+    float4 c0 = tex.SampleLevel(tSampler, texCoord - offset / texSize, level);
+    float4 c1 = tex.SampleLevel(tSampler, texCoord - float2(offset.x - sign(offset.x), offset.y) / texSize, level);
+    float4 c2 = tex.SampleLevel(tSampler, texCoord - float2(offset.x, offset.y - sign(offset.y)) / texSize, level);
+    return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
+}
+
+// Picks the level from how many base texels one pixel spans - the UV derivatives, taken by the
+// caller from the unclamped UVs - and blends the filtered results of the two levels either side, so
+// nothing pops as the distance changes. Where a texel covers a pixel or more the level is 0 and this
+// is the original filter. The level cannot come from Sample's own selection: the sampler is a point
+// sampler under three-point filtering, and the taps sit on snapped coordinates whose derivatives are
+// noise.
+float4 tex2D3PointFilterMip(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize, in uint mipLevels, in float2 dUVdx, in float2 dUVdy) {
+    float2 dx = dUVdx * texSize;
+    float2 dy = dUVdy * texSize;
+    float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-8));
+    lod = clamp(lod, 0.0, float(mipLevels - 1));
+    float l0 = floor(lod);
+    float blend = lod - l0;
+    float4 c0 = tex2D3PointFilterLevel(tex, tSampler, texCoord, max(texSize / exp2(l0), 1.0), l0);
+    if (blend <= 0.0) {
+        return c0;
+    }
+    float4 c1 = tex2D3PointFilterLevel(tex, tSampler, texCoord, max(texSize / exp2(l0 + 1.0), 1.0), l0 + 1.0);
+    return lerp(c0, c1, blend);
 }
 @end
 
@@ -213,6 +246,9 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
             @end
 
             @if(o_three_point_filtering)
+                // Outside every branch, and from the UVs before any clamp: the footprint of the pixel.
+                float2 uvDx@{i} = ddx(input.uv@{i});
+                float2 uvDy@{i} = ddy(input.uv@{i});
                 float4 texVal@{i};
                 if (textures[@{i}].linear_filtering) {
                     @if(o_masks[i])
@@ -228,7 +264,11 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
 
                         texVal@{i} = lerp(texVal@{i}, blendVal@{i}, maskVal@{i}.a);
                     @else
-                        texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
+                        if (textures[@{i}].mip_levels > 1) {
+                            texVal@{i} = tex2D3PointFilterMip(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mip_levels, uvDx@{i}, uvDy@{i});
+                        } else {
+                            texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
+                        }
                     @end
                 } else {
                     texVal@{i} = g_texture@{i}.Sample(g_sampler@{i}, tc@{i});

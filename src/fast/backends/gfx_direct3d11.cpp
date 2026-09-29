@@ -1,6 +1,7 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -577,6 +578,49 @@ static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
     return (val & G_TX_MIRROR) ? D3D11_TEXTURE_ADDRESS_MIRROR : D3D11_TEXTURE_ADDRESS_WRAP;
 }
 
+// One level of a mip chain (sturdy-bassoon#146): each texel the box average of the 2x2 (or 2x1) it
+// covers. Colour is weighted by alpha, so a cut-out's transparent texels - whose colour is whatever
+// the palette left there - do not bleed into its edge; alpha is a plain average. Averaged in the
+// texture's own (gamma) space rather than linear light on purpose: the three-point filter blends
+// level 0 in that space, so a linear-light chain would step in brightness where it takes over.
+static void DownsampleRgba32(const uint8_t* src, uint32_t w, uint32_t h, uint8_t* dst, uint32_t dw, uint32_t dh) {
+    for (uint32_t y = 0; y < dh; y++) {
+        // Parenthesised: <windows.h> may define min and max as macros.
+        const uint32_t y0 = (std::min)(y * 2, h - 1);
+        const uint32_t y1 = (std::min)(y * 2 + 1, h - 1);
+        for (uint32_t x = 0; x < dw; x++) {
+            const uint32_t x0 = (std::min)(x * 2, w - 1);
+            const uint32_t x1 = (std::min)(x * 2 + 1, w - 1);
+            const uint8_t* p[4] = { src + (y0 * w + x0) * 4, src + (y0 * w + x1) * 4, src + (y1 * w + x0) * 4,
+                                    src + (y1 * w + x1) * 4 };
+            uint32_t a = 0;
+            uint32_t c[3] = { 0, 0, 0 };
+            uint32_t plain[3] = { 0, 0, 0 };
+            for (const uint8_t* t : p) {
+                a += t[3];
+                for (int k = 0; k < 3; k++) {
+                    c[k] += t[k] * t[3];
+                    plain[k] += t[k];
+                }
+            }
+            uint8_t* out = dst + (y * dw + x) * 4;
+            for (int k = 0; k < 3; k++) {
+                // All four transparent: nothing to weight by, so the plain average (it is invisible).
+                out[k] = (uint8_t)(a != 0 ? (c[k] + a / 2) / a : (plain[k] + 2) / 4);
+            }
+            out[3] = (uint8_t)((a + 2) / 4);
+        }
+    }
+}
+
+void GfxRenderingAPIDX11::SetNextUploadMipmaps(bool mipmaps) {
+    mNextUploadMipmaps = mipmaps;
+}
+
+// A D3D11 texture side is at most 16384 (D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION), so a full chain is at
+// most 15 levels; the arrays below are sized for that.
+static constexpr uint32_t kMaxMipLevels = 15;
+
 void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         return;
@@ -588,6 +632,22 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     texture_data->width = width;
     texture_data->height = height;
 
+    // A full chain down to 1x1 when the interpreter asked for one (sturdy-bassoon#146), built here on
+    // the CPU: the textures are a few KB, and GenerateMips would need a render-target texture instead
+    // of an immutable one. Powers of two only, so each level is exactly half the one above and the
+    // sampler's wrap lines up at every level.
+    const bool pow2 = (width & (width - 1)) == 0 && (height & (height - 1)) == 0;
+    uint32_t levels = 1;
+    if (mNextUploadMipmaps && pow2) {
+        for (uint32_t m = (std::max)(width, height); m > 1 && levels < kMaxMipLevels; m >>= 1) {
+            levels++;
+        }
+    }
+    texture_data->mip_levels = levels;
+    if (levels > 1) {
+        mMippedUploads++;
+    }
+
     D3D11_TEXTURE2D_DESC texture_desc;
     ZeroMemory(&texture_desc, sizeof(D3D11_TEXTURE2D_DESC));
 
@@ -597,19 +657,35 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture_desc.CPUAccessFlags = 0;
-    texture_desc.MiscFlags = 0; // D3D11_RESOURCE_MISC_GENERATE_MIPS ?
+    texture_desc.MiscFlags = 0;
     texture_desc.ArraySize = 1;
-    texture_desc.MipLevels = 1;
+    texture_desc.MipLevels = levels;
     texture_desc.SampleDesc.Count = 1;
     texture_desc.SampleDesc.Quality = 0;
 
-    D3D11_SUBRESOURCE_DATA resource_data;
-    resource_data.pSysMem = rgba32_buf;
-    resource_data.SysMemPitch = width * 4;
-    resource_data.SysMemSlicePitch = resource_data.SysMemPitch * height;
+    D3D11_SUBRESOURCE_DATA resource_data[kMaxMipLevels];
+    std::vector<uint8_t> chain[kMaxMipLevels - 1];
+    resource_data[0].pSysMem = rgba32_buf;
+    resource_data[0].SysMemPitch = width * 4;
+    resource_data[0].SysMemSlicePitch = resource_data[0].SysMemPitch * height;
+    const uint8_t* src = rgba32_buf;
+    uint32_t w = width;
+    uint32_t h = height;
+    for (uint32_t level = 1; level < levels; level++) {
+        const uint32_t dw = (std::max)(w / 2, 1u);
+        const uint32_t dh = (std::max)(h / 2, 1u);
+        chain[level - 1].resize((size_t)dw * dh * 4);
+        DownsampleRgba32(src, w, h, chain[level - 1].data(), dw, dh);
+        resource_data[level].pSysMem = chain[level - 1].data();
+        resource_data[level].SysMemPitch = dw * 4;
+        resource_data[level].SysMemSlicePitch = dw * 4 * dh;
+        src = chain[level - 1].data();
+        w = dw;
+        h = dh;
+    }
 
     ThrowIfFailed(
-        mDevice->CreateTexture2D(&texture_desc, &resource_data, texture_data->texture.ReleaseAndGetAddressOf()));
+        mDevice->CreateTexture2D(&texture_desc, resource_data, texture_data->texture.ReleaseAndGetAddressOf()));
 
     // Create shader resource view from texture
 
@@ -840,6 +916,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                     mPerDrawCbData.mTextures[i].width = mTextures[mCurrentTextureIds[i]].width;
                     mPerDrawCbData.mTextures[i].height = mTextures[mCurrentTextureIds[i]].height;
                     mPerDrawCbData.mTextures[i].linear_filtering = mTextures[mCurrentTextureIds[i]].linear_filtering;
+                    mPerDrawCbData.mTextures[i].mip_levels = mTextures[mCurrentTextureIds[i]].mip_levels;
                     textures_changed = true;
                 }
 
@@ -1178,6 +1255,7 @@ uint32_t GfxRenderingAPIDX11::HoldStaticTexture(int slot) {
     hold.width = td.width;
     hold.height = td.height;
     hold.linearFiltering = td.linear_filtering;
+    hold.mipLevels = td.mip_levels;
     hold.refs = 1;
     mStaticTextureIndex.emplace(key, handle);
     return handle;
@@ -1225,6 +1303,7 @@ void GfxRenderingAPIDX11::BindStaticTextures(const StaticBakeDraw& draw, const s
         cb.width = hold != nullptr ? hold->width : 0;
         cb.height = hold != nullptr ? hold->height : 0;
         cb.linear_filtering = hold != nullptr && hold->linearFiltering ? 1 : 0;
+        cb.mip_levels = hold != nullptr ? hold->mipLevels : 1;
     }
     // Uploaded whether or not this program reads it: the next interpreted draw decides by the current
     // filter mode rather than its program's, and skips the upload when its view is unchanged. The

@@ -15,6 +15,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <list>
 #include <stack>
@@ -30,6 +31,7 @@
 #include "fast/interpreter.h"
 #include "fast/PerfCounters.h"
 #include "fast/StaticMeshCache.h"
+#include "fast/TextureMips.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -76,6 +78,43 @@ std::stack<std::string> currentDir;
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
+
+// ---- Mipmaps for the host's own textures (sturdy-bassoon#146, fast/TextureMips.h) ----
+// Game thread only, like the static bake's registry: the host registers at room load and the
+// interpreter walks on the same thread.
+namespace {
+// Display lists the host named as its own.
+std::unordered_set<const void*> sMipScopeLists;
+// Raw texture addresses one of those lists loaded. Grows, never shrinks: the lists are C symbols, so
+// their textures are too, and a later scene sharing a texture shares the address.
+std::unordered_set<const void*> sMipTextures;
+bool sMipsEnabled = true;
+// While the interpreter is inside a scoped list: the command-stack depth that list runs at, so the
+// scope ends when the stack drops below it. 0 = outside every scoped list.
+size_t sMipScopeDepth = 0;
+} // namespace
+
+void TextureMipsRegisterDisplayList(const void* displayList) {
+    if (displayList != nullptr) {
+        sMipScopeLists.insert(displayList);
+    }
+}
+
+void TextureMipsSetEnabled(bool enabled) {
+    if (enabled == sMipsEnabled) {
+        return;
+    }
+    sMipsEnabled = enabled;
+    // Every cached texture was uploaded under the old setting, and every bake holds those uploads.
+    // A cache clear alone would leave the bakes drawing the old ones.
+    gfx_texture_cache_clear();
+    StaticBakeInvalidateAll();
+}
+
+bool TextureMipsIsEnabled() {
+    return sMipsEnabled;
+}
+
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -1405,6 +1444,22 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         }
     } uploadNote{ mRenderingState.mTextures[i], mRapi, mRapi->TexturesUploaded() };
 #endif
+
+    // One of the host's own textures gets a mip chain on this upload (sturdy-bassoon#146). Cleared on
+    // the way out whichever return is taken, so no other upload inherits it. A replacement import
+    // (a texture pack's mask) is never ours.
+    struct MipNote {
+        GfxRenderingAPI* rapi;
+        bool on;
+        ~MipNote() {
+            if (on) {
+                rapi->SetNextUploadMipmaps(false);
+            }
+        }
+    } mipNote{ mRapi, sMipsEnabled && !importReplacement && sMipTextures.contains(origAddr) };
+    if (mipNote.on) {
+        mRapi->SetNextUploadMipmaps(true);
+    }
 
     // Guard against zero-sized textures that would cause divide-by-zero
     // or GPU API errors in UploadTexture.
@@ -3411,6 +3466,7 @@ void GfxExecStack::start(F3DGfx* dlist) {
     gfx_path.clear();
     cmd_stack.push(dlist);
     disp_stack.clear();
+    sMipScopeDepth = 0;
 }
 
 void GfxExecStack::stop() {
@@ -3460,6 +3516,10 @@ F3DGfx* GfxExecStack::ret() {
         if (!gfx_path.empty()) {
             gfx_path.pop_back();
         }
+    }
+    // Left a mip-scoped list (sturdy-bassoon#146): whatever is called at this depth next is not it.
+    if (cmd_stack.size() < sMipScopeDepth) {
+        sMipScopeDepth = 0;
     }
     return cmd;
 }
@@ -3891,6 +3951,12 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                 return false;
             }
 #endif
+            // Entering a list the host named for mipmaps (sturdy-bassoon#146): everything it and its
+            // callees load is in scope until the stack drops back below this depth. A baked list that
+            // replays never gets here, and needs nothing: its draws hold the textures it recorded.
+            if (sMipScopeDepth == 0 && !sMipScopeLists.empty() && sMipScopeLists.contains(subGFX)) {
+                sMipScopeDepth = g_exec_stack.cmd_stack.size() + 1;
+            }
             g_exec_stack.call(*cmd0, subGFX);
         }
     } else {
@@ -4205,6 +4271,12 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     if (!IsValidResolvedAddress(i)) {
         return false;
+    }
+
+    // A raw texture (no archive resource) loaded inside a list the host named for mipmaps is one of
+    // the host's own (sturdy-bassoon#146). Collected here, before the import that uploads it.
+    if (sMipScopeDepth != 0 && rawTexMetdata.resource == nullptr && g_exec_stack.cmd_stack.size() >= sMipScopeDepth) {
+        sMipTextures.insert((const void*)i);
     }
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
@@ -5697,6 +5769,26 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+void Fast::TextureMipsGetStats(uint32_t* lists, uint32_t* addresses, uint64_t* mippedUploads) {
+    if (lists != nullptr) {
+        *lists = (uint32_t)Fast::sMipScopeLists.size();
+    }
+    if (addresses != nullptr) {
+        *addresses = (uint32_t)Fast::sMipTextures.size();
+    }
+    if (mippedUploads != nullptr) {
+        auto gfx = Fast::mInstance.lock();
+        GfxRenderingAPI* rapi = gfx != nullptr ? gfx->GetCurrentRenderingAPI() : nullptr;
+        *mippedUploads = rapi != nullptr ? rapi->MippedUploads() : 0;
+    }
+}
+
+int Fast::TextureMipsFilterMode() {
+    auto gfx = Fast::mInstance.lock();
+    GfxRenderingAPI* rapi = gfx != nullptr ? gfx->GetCurrentRenderingAPI() : nullptr;
+    return rapi != nullptr ? (int)rapi->GetTextureFilter() : -1;
 }
 
 extern "C" void gfx_shader_cache_clear() {

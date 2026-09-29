@@ -24,7 +24,9 @@ struct PerDrawCB {
         uint32_t width;
         uint32_t height;
         uint32_t linear_filtering;
-        uint32_t padding;
+        // Levels in the bound view (sturdy-bassoon#146): 1 for every texture but the host's own
+        // mipmapped ones, and the three-point shader keeps its original path at 1. Was padding.
+        uint32_t mip_levels;
     } mTextures[SHADER_MAX_TEXTURES];
 };
 
@@ -50,6 +52,7 @@ struct TextureData {
     uint32_t width;
     uint32_t height;
     bool linear_filtering;
+    uint32_t mip_levels = 1; // sturdy-bassoon#146
 };
 
 struct FramebufferDX11 {
@@ -86,7 +89,8 @@ struct StaticTextureHoldDX11 {
     uint32_t width;
     uint32_t height;
     bool linearFiltering;
-    uint32_t refs; // 0 = a free slot
+    uint32_t mipLevels; // a property of the view, so not part of the dedup key
+    uint32_t refs;      // 0 = a free slot
 };
 
 class GfxWindowBackendDXGI;
@@ -108,6 +112,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
+    void SetNextUploadMipmaps(bool mipmaps) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
@@ -242,6 +247,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     std::map<std::tuple<void*, void*, bool>, uint32_t> mStaticTextureIndex;
 
     std::vector<struct TextureData> mTextures;
+    // The next UploadTexture builds a mip chain (sturdy-bassoon#146); the interpreter sets it around
+    // one import of the host's own texture.
+    bool mNextUploadMipmaps = false;
     int mCurrentTile;
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
 
