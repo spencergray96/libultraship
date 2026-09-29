@@ -617,6 +617,18 @@ void GfxRenderingAPIDX11::SetNextUploadMipmaps(bool mipmaps) {
     mNextUploadMipmaps = mipmaps;
 }
 
+void GfxRenderingAPIDX11::SetMipLod(int mode, float bias) {
+    if ((uint32_t)mode == mMipLodMode && bias == mMipLodBias) {
+        return;
+    }
+    mMipLodMode = (uint32_t)mode;
+    mMipLodBias = bias;
+    // DrawTriangles rewrites a slot's PerDrawCB entry only when the slot's view changes, so the next
+    // one writes the new choice into every slot and uploads (the memos are left alone: they say what
+    // is really bound). Baked draws write theirs on every bind anyway (BindStaticTextures).
+    mMipLodDirty = true;
+}
+
 // A D3D11 texture side is at most 16384 (D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION), so a full chain is at
 // most 15 levels; the arrays below are sized for that.
 static constexpr uint32_t kMaxMipLevels = 15;
@@ -917,6 +929,8 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                     mPerDrawCbData.mTextures[i].height = mTextures[mCurrentTextureIds[i]].height;
                     mPerDrawCbData.mTextures[i].linear_filtering = mTextures[mCurrentTextureIds[i]].linear_filtering;
                     mPerDrawCbData.mTextures[i].mip_levels = mTextures[mCurrentTextureIds[i]].mip_levels;
+                    mPerDrawCbData.mTextures[i].lod_bias = mMipLodBias;
+                    mPerDrawCbData.mTextures[i].lod_mode = mMipLodMode;
                     textures_changed = true;
                 }
 
@@ -926,6 +940,15 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
             }
             mContext->PSSetSamplers(i, 1, mTextures[mCurrentTextureIds[i]].sampler_state.GetAddressOf());
         }
+    }
+
+    if (mMipLodDirty) {
+        for (auto& t : mPerDrawCbData.mTextures) {
+            t.lod_bias = mMipLodBias;
+            t.lod_mode = mMipLodMode;
+        }
+        mMipLodDirty = false;
+        textures_changed = true;
     }
 
     // Set per-draw constant buffer
@@ -1304,6 +1327,8 @@ void GfxRenderingAPIDX11::BindStaticTextures(const StaticBakeDraw& draw, const s
         cb.height = hold != nullptr ? hold->height : 0;
         cb.linear_filtering = hold != nullptr && hold->linearFiltering ? 1 : 0;
         cb.mip_levels = hold != nullptr ? hold->mipLevels : 1;
+        cb.lod_bias = mMipLodBias;
+        cb.lod_mode = mMipLodMode;
     }
     // Uploaded whether or not this program reads it: the next interpreted draw decides by the current
     // filter mode rather than its program's, and skips the upload when its view is unchanged. The

@@ -193,6 +193,10 @@ class GfxRenderingAPI {
     // chain. A backend that ignores it (every one but DX11 today) uploads one level, as before.
     virtual void SetNextUploadMipmaps(bool mipmaps) {
     }
+    // How the shader picks a mipmapped texture's level: fast/TextureMips.h TextureMipsLodMode, and a
+    // bias added to it. Takes effect from the next draw.
+    virtual void SetMipLod(int mode, float bias) {
+    }
     // Uploads that really built more than one level: a texture that is not a power of two gets one
     // level even when asked, and so does every texture on a backend that ignores the request.
     uint64_t MippedUploads() const {

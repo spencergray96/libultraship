@@ -55,4 +55,18 @@ void TextureMipsGetStats(uint32_t* lists, uint32_t* addresses, uint64_t* mippedU
 // say which, without including the interpreter.
 int TextureMipsFilterMode();
 
+// How the three-point shader picks the level (sturdy-bassoon#146 follow-up). A pixel's footprint on
+// the texture is two lengths, one per screen axis; at a grazing angle they differ by a lot.
+//   MAX    the level of the longer one. Never crawls, but blurs a grazing wall along its short
+//          axis. The original choice.
+//   MEAN   the level of their geometric mean. Sharper; some crawl can come back along the long axis.
+//   ANISO  the level of the shorter one (with the footprint's long side split into up to 4), and up
+//          to 4 filtered samples spread along the long axis, averaged. Sharp and stable; costs up
+//          to 4x the samples, only on a minified mipped texture.
+// bias is added to the chosen level (negative = sharper). Applied from the next draw, baked draws
+// included; no re-record. Mode is clamped to the three, bias to [-4, 4].
+enum TextureMipsLodMode { TEXTURE_MIPS_LOD_MAX = 0, TEXTURE_MIPS_LOD_MEAN = 1, TEXTURE_MIPS_LOD_ANISO = 2 };
+void TextureMipsSetLod(int mode, float bias);
+void TextureMipsGetLod(int* mode, float* bias);
+
 } // namespace Fast

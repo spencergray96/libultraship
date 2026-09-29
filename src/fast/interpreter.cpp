@@ -92,6 +92,10 @@ bool sMipsEnabled = true;
 // While the interpreter is inside a scoped list: the command-stack depth that list runs at, so the
 // scope ends when the stack drops below it. 0 = outside every scoped list.
 size_t sMipScopeDepth = 0;
+// How the shader picks a level (TextureMipsSetLod). The host sets it after the renderer exists
+// (SoH: ShipInit, which runs after the window is created); a set before then is only stored here.
+int sMipLodMode = TEXTURE_MIPS_LOD_MAX;
+float sMipLodBias = 0.0f;
 } // namespace
 
 void TextureMipsRegisterDisplayList(const void* displayList) {
@@ -5782,6 +5786,25 @@ void Fast::TextureMipsGetStats(uint32_t* lists, uint32_t* addresses, uint64_t* m
         auto gfx = Fast::mInstance.lock();
         GfxRenderingAPI* rapi = gfx != nullptr ? gfx->GetCurrentRenderingAPI() : nullptr;
         *mippedUploads = rapi != nullptr ? rapi->MippedUploads() : 0;
+    }
+}
+
+void Fast::TextureMipsSetLod(int mode, float bias) {
+    Fast::sMipLodMode = mode < TEXTURE_MIPS_LOD_MAX || mode > TEXTURE_MIPS_LOD_ANISO ? TEXTURE_MIPS_LOD_MAX : mode;
+    Fast::sMipLodBias = bias < -4.0f ? -4.0f : (bias > 4.0f ? 4.0f : bias);
+    auto gfx = Fast::mInstance.lock();
+    GfxRenderingAPI* rapi = gfx != nullptr ? gfx->GetCurrentRenderingAPI() : nullptr;
+    if (rapi != nullptr) {
+        rapi->SetMipLod(Fast::sMipLodMode, Fast::sMipLodBias);
+    }
+}
+
+void Fast::TextureMipsGetLod(int* mode, float* bias) {
+    if (mode != nullptr) {
+        *mode = Fast::sMipLodMode;
+    }
+    if (bias != nullptr) {
+        *bias = Fast::sMipLodBias;
     }
 }
 

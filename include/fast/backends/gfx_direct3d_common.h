@@ -27,6 +27,11 @@ struct PerDrawCB {
         // Levels in the bound view (sturdy-bassoon#146): 1 for every texture but the host's own
         // mipmapped ones, and the three-point shader keeps its original path at 1. Was padding.
         uint32_t mip_levels;
+        // How the shader picks a mipmapped texture's level (fast/TextureMips.h). The same for every
+        // texture; per slot because this is the buffer the shader already reads per texture.
+        float lod_bias;
+        uint32_t lod_mode;
+        uint32_t padding[2];
     } mTextures[SHADER_MAX_TEXTURES];
 };
 
@@ -113,6 +118,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
     void SetNextUploadMipmaps(bool mipmaps) override;
+    void SetMipLod(int mode, float bias) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
@@ -250,6 +256,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // The next UploadTexture builds a mip chain (sturdy-bassoon#146); the interpreter sets it around
     // one import of the host's own texture.
     bool mNextUploadMipmaps = false;
+    // The level choice for mipmapped textures (SetMipLod), written into PerDrawCB at every bind.
+    uint32_t mMipLodMode = 0;
+    float mMipLodBias = 0.0f;
+    // SetMipLod changed the choice: the next DrawTriangles writes it into every slot and uploads.
+    bool mMipLodDirty = false;
     int mCurrentTile;
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
 

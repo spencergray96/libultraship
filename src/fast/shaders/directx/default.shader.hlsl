@@ -84,6 +84,10 @@ cbuffer PerDrawCB : register(b1) {
         uint height;
         bool linear_filtering;
         uint mip_levels;
+        float lod_bias;
+        uint lod_mode;
+        uint pad0;
+        uint pad1;
     } textures[2];
 }
 
@@ -109,16 +113,9 @@ float4 tex2D3PointFilterLevel(in Texture2D tex, in SamplerState tSampler, in flo
     return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
 }
 
-// Picks the level from how many base texels one pixel spans - the UV derivatives, taken by the
-// caller from the unclamped UVs - and blends the filtered results of the two levels either side, so
-// nothing pops as the distance changes. Where a texel covers a pixel or more the level is 0 and this
-// is the original filter. The level cannot come from Sample's own selection: the sampler is a point
-// sampler under three-point filtering, and the taps sit on snapped coordinates whose derivatives are
-// noise.
-float4 tex2D3PointFilterMip(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize, in uint mipLevels, in float2 dUVdx, in float2 dUVdy) {
-    float2 dx = dUVdx * texSize;
-    float2 dy = dUVdy * texSize;
-    float lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-8));
+// The filtered results of the two levels either side of lod, blended, so nothing pops as the
+// distance changes. At lod 0 or below this is the original filter on the base level.
+float4 tex2D3PointFilterAtLod(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize, in uint mipLevels, in float lod) {
     lod = clamp(lod, 0.0, float(mipLevels - 1));
     float l0 = floor(lod);
     float blend = lod - l0;
@@ -128,6 +125,41 @@ float4 tex2D3PointFilterMip(in Texture2D tex, in SamplerState tSampler, in float
     }
     float4 c1 = tex2D3PointFilterLevel(tex, tSampler, texCoord, max(texSize / exp2(l0 + 1.0), 1.0), l0 + 1.0);
     return lerp(c0, c1, blend);
+}
+
+// Picks the level from how many base texels one pixel spans - the UV derivatives, taken by the
+// caller from the unclamped UVs. The level cannot come from Sample's own selection: the sampler is a
+// point sampler under three-point filtering, and the taps sit on snapped coordinates whose
+// derivatives are noise. A pixel's footprint is two lengths, one per screen axis; lodMode says which
+// sets the level (fast/TextureMips.h): 0 the longer (never crawls, blurs a grazing surface), 1 their
+// geometric mean, 2 anisotropic - the shorter, with up to 4 samples spread along the longer. Where
+// the footprint is a texel or less, every mode is the original filter.
+float4 tex2D3PointFilterMip(in Texture2D tex, in SamplerState tSampler, in float2 texCoord, in float2 texSize, in uint mipLevels, in float2 dUVdx, in float2 dUVdy, in uint lodMode, in float lodBias, in float4 tcBox) {
+    float2 dx = dUVdx * texSize;
+    float2 dy = dUVdy * texSize;
+    float la = max(dot(dx, dx), 1e-8);
+    float lb = max(dot(dy, dy), 1e-8);
+    float major = max(la, lb);
+    float minor = min(la, lb);
+    if (major <= 1.0) {
+        return tex2D3PointFilterAtLod(tex, tSampler, texCoord, texSize, mipLevels, 0.0);
+    }
+    if (lodMode == 2) {
+        // Split the long side into up to 4 pieces, each filtered at the level that fits it.
+        float taps = clamp(ceil(sqrt(major / minor) - 0.01), 1.0, 4.0);
+        float lod = 0.5 * log2(major) - log2(taps) + lodBias;
+        float2 axis = la >= lb ? dUVdx : dUVdy;
+        float4 sum = float4(0, 0, 0, 0);
+        for (int k = 0; k < 4; k++) {
+            if (k < taps) {
+                float2 tapCoord = clamp(texCoord + axis * ((k + 0.5) / taps - 0.5), tcBox.xy, tcBox.zw);
+                sum += tex2D3PointFilterAtLod(tex, tSampler, tapCoord, texSize, mipLevels, lod);
+            }
+        }
+        return sum / taps;
+    }
+    float lod = (lodMode == 1 ? 0.25 * log2(la * lb) : 0.5 * log2(major)) + lodBias;
+    return tex2D3PointFilterAtLod(tex, tSampler, texCoord, texSize, mipLevels, lod);
 }
 @end
 
@@ -231,6 +263,9 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
     @for(i in 0..2)
         @if(o_textures[i])
             float2 tc@{i} = input.uv@{i};
+            // The clamp emulation's box (min.xy, max.zw), for the anisotropic taps that sample around
+            // tc (sturdy-bassoon#146); unbounded where the axis is not clamped.
+            float4 tcBox@{i} = float4(-1e30, -1e30, 1e30, 1e30);
             @{s = o_clamp[i][0]}
             @{t = o_clamp[i][1]}
             @if(s || t)
@@ -238,10 +273,13 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
                 g_texture@{i}.GetDimensions(texSize@{i}.x, texSize@{i}.y);
                 @if(s && t)
                     tc@{i} = clamp(tc@{i}, 0.5 / texSize@{i}, float2(input.texClampS@{i}, input.texClampT@{i}));
+                    tcBox@{i} = float4(0.5 / texSize@{i}, input.texClampS@{i}, input.texClampT@{i});
                 @elseif(s)
                     tc@{i} = float2(clamp(tc@{i}.x, 0.5 / texSize@{i}.x, input.texClampS@{i}), tc@{i}.y);
+                    tcBox@{i}.xz = float2(0.5 / texSize@{i}.x, input.texClampS@{i});
                 @else
                     tc@{i} = float2(tc@{i}.x, clamp(tc@{i}.y, 0.5 / texSize@{i}.y, input.texClampT@{i}));
+                    tcBox@{i}.yw = float2(0.5 / texSize@{i}.y, input.texClampT@{i});
                 @end
             @end
 
@@ -265,7 +303,7 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
                         texVal@{i} = lerp(texVal@{i}, blendVal@{i}, maskVal@{i}.a);
                     @else
                         if (textures[@{i}].mip_levels > 1) {
-                            texVal@{i} = tex2D3PointFilterMip(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mip_levels, uvDx@{i}, uvDy@{i});
+                            texVal@{i} = tex2D3PointFilterMip(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height), textures[@{i}].mip_levels, uvDx@{i}, uvDy@{i}, textures[@{i}].lod_mode, textures[@{i}].lod_bias, tcBox@{i});
                         } else {
                             texVal@{i} = tex2D3PointFilter(g_texture@{i}, g_sampler@{i}, tc@{i}, float2(textures[@{i}].width, textures[@{i}].height));
                         }
