@@ -3,6 +3,7 @@
 #ifdef ENABLE_STATIC_BAKE
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -26,7 +27,8 @@ enum class BakeState : uint8_t {
 // One replayed draw call: a contiguous run of the persistent buffer that shares a program, a render
 // state and its textures. The 256-triangle cap that breaks the interpreter's batches is a property
 // of its staging buffer, not of the geometry, so consecutive captured flushes with identical state
-// are merged here - that is the difference between ~9 draws per room and ~289.
+// are merged here - that is the difference between ~9 draws per room and ~289. SortByMaterial then
+// merges the ones that were not consecutive, before the upload.
 //
 // `gpu` is what the backend draws with: the program, the cull mode GfxSpTri1's CPU test would have
 // applied, the SHADE inputs the replay lights, the decal mode, and the draw's own held textures -
@@ -61,6 +63,7 @@ struct Entry {
 
 std::unordered_map<const void*, Entry> sEntries;
 bool sEnabled = false;
+bool sSortByMaterial = true;
 
 // The rendering backend, remembered the first time the interpreter reaches this file. The host
 // calls StaticBakeReset() from the game thread's scene-load path, where no Interpreter is in
@@ -303,6 +306,108 @@ void Replay(Interpreter* gfx, Entry& e) {
     gfx->mRenderingState.mShaderProgram = nullptr;
 }
 
+// How far a batch may move when a recording is ordered by material (sturdy-bassoon#158).
+enum class BatchOrder : uint8_t {
+    // Opaque, depth-tested and depth-written, not a decal: the depth test decides what shows, so
+    // these draw the same picture in any order - bar exactly coplanar surfaces, where the order
+    // picks the winner. Grouped by material.
+    Free,
+    // A decal or an alpha-blended batch under a depth test. Each has to draw after what it sits on
+    // or shows through to, so it goes after the Free batches around it, in its original order.
+    AfterOpaque,
+    // Anything else - no depth test, or an opaque batch that does not write depth - covers or is
+    // covered by exactly what came before and after it. Stays where it is; nothing moves past it.
+    Fixed,
+};
+
+BatchOrder OrderOf(const BakedDraw& d) {
+    const bool depthTest = (d.depthTestAndMask & 1) != 0;
+    const bool depthMask = (d.depthTestAndMask & 2) != 0;
+    if (!d.alphaBlend && !d.gpu.zmodeDecal && depthTest && depthMask) {
+        return BatchOrder::Free;
+    }
+    if (depthTest && (d.alphaBlend || d.gpu.zmodeDecal)) {
+        return BatchOrder::AfterOpaque;
+    }
+    return BatchOrder::Fixed;
+}
+
+// Reorder a finished recording so batches of one material sit together, then merge them into one
+// draw each. A draw call is one material, and the capture merges a batch only into the one right
+// before it, so a list that alternates materials - props of different kinds, or one prop drawn in
+// two materials - was a draw per batch. Grouped, it is about one draw per material per run of Free
+// batches. Materials keep the order they first appear in, so the result is the same every session.
+//
+// Called before the upload, on the staging buffer: rebuilds it in the new order (one copy), and
+// releases the texture references the merges make redundant, as the capture's own merge does.
+// Returns the time it took, for the log.
+double SortByMaterial(Entry& e) {
+    const auto start = std::chrono::steady_clock::now();
+    const std::vector<BakedDraw>& in = e.draws;
+
+    std::vector<size_t> order;
+    order.reserve(in.size());
+    std::vector<std::vector<size_t>> groups; // this run's Free batches, one group per material
+    std::vector<size_t> afterOpaque;         // this run's AfterOpaque batches, in list order
+    auto closeRun = [&]() {
+        for (const std::vector<size_t>& g : groups) {
+            order.insert(order.end(), g.begin(), g.end());
+        }
+        order.insert(order.end(), afterOpaque.begin(), afterOpaque.end());
+        groups.clear();
+        afterOpaque.clear();
+    };
+    for (size_t i = 0; i < in.size(); i++) {
+        switch (OrderOf(in[i])) {
+            case BatchOrder::Free: {
+                auto g = std::find_if(groups.begin(), groups.end(),
+                                      [&](const std::vector<size_t>& grp) { return SameDrawState(in[grp[0]], in[i]); });
+                if (g != groups.end()) {
+                    g->push_back(i);
+                } else {
+                    groups.push_back({ i });
+                }
+                break;
+            }
+            case BatchOrder::AfterOpaque:
+                afterOpaque.push_back(i);
+                break;
+            case BatchOrder::Fixed:
+                closeRun();
+                order.push_back(i);
+                break;
+        }
+    }
+    closeRun();
+
+    bool moved = false;
+    for (size_t i = 0; i < order.size() && !moved; i++) {
+        moved = order[i] != i;
+    }
+    if (moved) {
+        std::vector<float> staging;
+        staging.reserve(e.staging.size());
+        std::vector<BakedDraw> draws;
+        for (size_t idx : order) {
+            BakedDraw d = in[idx];
+            const size_t first = d.gpu.byteOffset / sizeof(float);
+            const size_t count = (size_t)d.gpu.numTris * 3 * d.numFloats;
+            d.gpu.byteOffset = staging.size() * sizeof(float);
+            staging.insert(staging.end(), e.staging.begin() + first, e.staging.begin() + first + count);
+            // Appended in order, so a draw of the same state is always contiguous with the last one.
+            if (!draws.empty() && SameDrawState(draws.back(), d)) {
+                draws.back().gpu.numTris += d.gpu.numTris;
+                ReleaseTextures(d.gpu); // the same handles the merged-into draw already holds
+            } else {
+                draws.push_back(d);
+            }
+        }
+        e.staging.swap(staging);
+        e.draws.swap(draws);
+    }
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 void FinishRecording(Interpreter* gfx) {
     gfx->Flush(); // capture the tail batch while still recording
 
@@ -345,6 +450,12 @@ void FinishRecording(Interpreter* gfx) {
         }
     }
 
+    const size_t listOrderDraws = e->draws.size();
+    double sortMs = 0.0;
+    if (!rejected && sSortByMaterial) {
+        sortMs = SortByMaterial(*e);
+    }
+
     if (!rejected) {
         e->buffer = gfx->mRapi->CreateStaticBuffer(e->staging.data(), e->staging.size() * sizeof(float));
         if (e->buffer == 0) {
@@ -382,8 +493,13 @@ void FinishRecording(Interpreter* gfx) {
     }
 
     e->state = BakeState::Baked;
-    SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures", key,
-                e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws, held.size());
+    // The draws the list would have in list order, and what ordering it by material cost, after the
+    // fields older run scripts parse.
+    SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures; "
+                "{} draws in list order, {}",
+                key, e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws,
+                held.size(), listOrderDraws,
+                sSortByMaterial ? fmt::format("sorted by material in {:.2f} ms", sortMs) : std::string("not sorted"));
     e->staging.clear();
     e->staging.shrink_to_fit();
 
@@ -405,6 +521,17 @@ void StaticBakeSetEnabled(bool enabled) {
 
 bool StaticBakeIsEnabled() {
     return sEnabled;
+}
+
+void StaticBakeSetSortByMaterial(bool sort) {
+    if (sort != sSortByMaterial) {
+        sSortByMaterial = sort;
+        StaticBakeInvalidateAll(); // the order is decided at record time
+    }
+}
+
+bool StaticBakeSortsByMaterial() {
+    return sSortByMaterial;
 }
 
 void StaticBakeRegister(const void* displayList) {
@@ -708,6 +835,11 @@ bool gStaticBakeRecording = false;
 void StaticBakeSetEnabled(bool) {
 }
 bool StaticBakeIsEnabled() {
+    return false;
+}
+void StaticBakeSetSortByMaterial(bool) {
+}
+bool StaticBakeSortsByMaterial() {
     return false;
 }
 void StaticBakeRegister(const void*) {

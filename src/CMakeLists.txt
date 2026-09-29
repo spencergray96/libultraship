@@ -143,10 +143,12 @@ endif()
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})
 
-# Static-geometry bake prototype (sturdy-bassoon#40 Stage 1) - see src/fast/StaticMeshCache.cpp.
-# The feature is additionally gated at runtime by the host (SOH_STATIC_BAKE=1); with the env var
-# unset nothing is ever registered and the interpreter takes its normal path. PUBLIC so the host
-# can compile its registration side against the same flag.
+# Static-geometry bake (sturdy-bassoon#40 Stage 1, #142) - see src/fast/StaticMeshCache.cpp.
+# At runtime the host decides whether it bakes (StaticBakeSetEnabled). In SoH it is on by default
+# since sturdy-bassoon#153: SOH_STATIC_BAKE=0|1 decides a session when set, and otherwise the saved
+# gSettings.StaticBake setting (default on). Off, the host still registers its rooms, but every
+# display list takes the interpreter's normal path. Only the DX11 backend replays a bake. PUBLIC so
+# the host can compile its registration side against the same flag.
 target_compile_definitions(libultraship PUBLIC ENABLE_STATIC_BAKE)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")

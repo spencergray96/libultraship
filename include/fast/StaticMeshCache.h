@@ -60,6 +60,16 @@ struct StaticBakeUniforms;
 void StaticBakeSetEnabled(bool enabled);
 bool StaticBakeIsEnabled();
 
+// Order each recording by material before it is uploaded (sturdy-bassoon#158), so one material is
+// one draw per list instead of one per stretch of the list that uses it. On by default. Opaque,
+// depth-tested batches regroup; decals and alpha-blended batches go after them in their original
+// order; a batch with no depth test, or opaque without depth writes, stays where it is. A change
+// sends every bake back to be recorded (StaticBakeInvalidateAll). Exists to compare the two orders
+// in one session, and as the way back if some content turns out to depend on list order (two
+// exactly coplanar opaque surfaces are the one known case).
+void StaticBakeSetSortByMaterial(bool sort);
+bool StaticBakeSortsByMaterial();
+
 // Offer one display list for baking. Keyed by pointer, which is only sound for display lists
 // whose address is a stable C symbol for the life of the process - i.e. compiled-in scene data.
 // Registering the same pointer twice is a no-op, so this is safe to call on every room init.
