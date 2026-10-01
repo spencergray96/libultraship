@@ -3903,6 +3903,17 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     size_t vtxDataOff = cmd->words.w1 & 0xFFFF;
     F3DVtx* vtx =
         (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+    if (vtx == nullptr) {
+        // A path that resolves to nothing loads no vertices. Before this check it handed GfxSpVertex
+        // a pointer just past null. A bake being recorded is refused rather than frozen with the
+        // piece missing (sturdy-bassoon#171).
+#ifdef ENABLE_STATIC_BAKE
+        if (gStaticBakeRecording) {
+            StaticBakeAbort(gfx, "archive vertices did not resolve");
+        }
+#endif
+        return false;
+    }
     vtx += vtxDataOff;
 
     gfx->GfxSpVertex(vtxCnt, vtxIdxOff, vtx);
@@ -3914,6 +3925,16 @@ bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
     char* fileName = (char*)cmd->words.w1;
     F3DGfx* nDL =
         (F3DGfx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+    if (nDL == nullptr) {
+        // Skipped, as a missing G_DL target is: before this check it reached the assert below. A bake
+        // being recorded is refused rather than frozen with the piece missing (sturdy-bassoon#171).
+#ifdef ENABLE_STATIC_BAKE
+        if (gStaticBakeRecording) {
+            StaticBakeAbort(mInstance.lock().get(), "archive display list did not resolve");
+        }
+#endif
+        return false;
+    }
 
     if (C0(16, 1) == 0 && nDL != nullptr) {
         g_exec_stack.call(*cmd0, nDL);
@@ -4379,6 +4400,12 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
                                   reinterpret_cast<char*>(texture->ImageData));
     } else {
         SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null");
+#ifdef ENABLE_STATIC_BAKE
+        // Refused rather than frozen with the previous texture bound (sturdy-bassoon#171).
+        if (gStaticBakeRecording) {
+            StaticBakeAbort(mInstance.lock().get(), "archive texture did not resolve");
+        }
+#endif
     }
     return false;
 }

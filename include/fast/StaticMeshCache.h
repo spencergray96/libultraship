@@ -92,6 +92,19 @@ void StaticBakeInvalidateAll();
 // For host-side logging only.
 void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejected);
 
+// One registered display list, for a host that reports on the lists it offered by name
+// (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
+// and triangles, 0 unless Baked. `rejectReason` is a string literal naming why the recorder refused
+// it, nullptr unless Rejected.
+enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
+struct StaticBakeEntryInfo {
+    StaticBakeEntryState state = StaticBakeEntryState::NotRegistered;
+    uint32_t draws = 0;
+    uint32_t tris = 0;
+    const char* rejectReason = nullptr;
+};
+StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------

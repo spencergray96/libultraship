@@ -59,7 +59,13 @@ struct Entry {
     std::vector<BakedDraw> draws;
     uint32_t buffer = 0;
     size_t totalTris = 0;
+    const char* rejectReason = nullptr; // a literal, set wherever state becomes Rejected
 };
+
+void Reject(Entry& e, const char* reason) {
+    e.state = BakeState::Rejected;
+    e.rejectReason = reason;
+}
 
 std::unordered_map<const void*, Entry> sEntries;
 bool sEnabled = false;
@@ -125,6 +131,16 @@ void BuildOpcodeTable() {
         0xfb, // G_SETENVCOLOR
         0xfc, // G_SETCOMBINE
         0xfd, // G_SETTIMG     (not through a segment - see the guard)
+        // Archive-loaded display lists (sturdy-bassoon#171, proven in #160): Fast64's hm64 XML emits
+        // these. Each names a resource by path, resolved through the resource manager as it runs, so
+        // the recording captures what the path resolved to then - as it does a texture's pixels. A
+        // path that resolves to nothing is refused in its handler (StaticBakeAbort), never frozen
+        // into a bake with a piece missing. The by-hash forms (0x20 G_VTX_OTR_HASH, 0x31
+        // G_DL_OTR_HASH, 0x32 G_SETTIMG_OTR_HASH) stay refused until something needs them.
+        0x24, // G_VTX_OTR_FILEPATH
+        0x25, // G_SETTIMG_OTR_FILEPATH
+        0x26, // G_TRI1_OTR    (G_TRI1 with 16-bit indices)
+        0x27, // G_DL_OTR_FILEPATH
     };
     for (uint8_t op : kAllowed) {
         sOpcodeAllowed[op] = true;
@@ -469,7 +485,7 @@ void FinishRecording(Interpreter* gfx) {
 
     if (rejected) {
         SPDLOG_WARN("[staticbake] display list {} rejected: {}", key, reason != nullptr ? reason : "unknown");
-        e->state = BakeState::Rejected;
+        Reject(*e, reason != nullptr ? reason : "unknown");
         ReleaseGpu(*e);
         return;
     }
@@ -584,6 +600,30 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
     }
 }
 
+StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
+    StaticBakeEntryInfo info;
+    auto it = sEntries.find(displayList);
+    if (it == sEntries.end()) {
+        return info;
+    }
+    const Entry& e = it->second;
+    switch (e.state) {
+        case BakeState::Unbaked:
+            info.state = StaticBakeEntryState::Unbaked;
+            break;
+        case BakeState::Baked:
+            info.state = StaticBakeEntryState::Baked;
+            info.draws = (uint32_t)e.draws.size();
+            info.tris = (uint32_t)e.totalTris;
+            break;
+        case BakeState::Rejected:
+            info.state = StaticBakeEntryState::Rejected;
+            info.rejectReason = e.rejectReason;
+            break;
+    }
+    return info;
+}
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API
 // ---------------------------------------------------------------------------
@@ -617,7 +657,7 @@ bool StaticBakeIntercept(Interpreter* gfx, void* displayList) {
     }
 
     if (!gfx->mRapi->SupportsStaticBake()) {
-        e.state = BakeState::Rejected;
+        Reject(e, "this rendering backend cannot bake");
         return false;
     }
 
@@ -734,7 +774,7 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode, uintptr_t w1) {
         memcpy(gfx->mRsp->MP_matrix, sSavedMpMatrix, sizeof(sSavedMpMatrix));
         if (sRecording != nullptr) {
             SPDLOG_WARN("[staticbake] display list {} rejected at opcode {:#04x}", sRecordingKey, (uint8_t)opcode);
-            sRecording->state = BakeState::Rejected;
+            Reject(*sRecording, "display list used an opcode the recorder does not understand");
             ReleaseGpu(*sRecording);
             sRecording = nullptr;
             sRecordingKey = nullptr;
@@ -817,7 +857,7 @@ void StaticBakeEndFrame(Interpreter* gfx) {
     gStaticBakeRecording = false;
     memcpy(gfx->mRsp->MP_matrix, sSavedMpMatrix, sizeof(sSavedMpMatrix));
     if (sRecording != nullptr) {
-        sRecording->state = BakeState::Rejected;
+        Reject(*sRecording, "display list never returned");
         ReleaseGpu(*sRecording);
         sRecording = nullptr;
         sRecordingKey = nullptr;
@@ -858,6 +898,10 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
     if (rejected != nullptr) {
         *rejected = 0;
     }
+}
+
+StaticBakeEntryInfo StaticBakeGetEntry(const void*) {
+    return {};
 }
 
 } // namespace Fast
