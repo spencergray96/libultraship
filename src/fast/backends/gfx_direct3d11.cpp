@@ -656,6 +656,7 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
         }
     }
     texture_data->mip_levels = levels;
+    mLastUploadLevels = levels;
     if (levels > 1) {
         mMippedUploads++;
     }

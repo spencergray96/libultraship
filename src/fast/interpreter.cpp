@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
 #include <any>
 #include <map>
 #include <set>
@@ -88,6 +89,14 @@ std::unordered_set<const void*> sMipScopeLists;
 // Raw texture addresses one of those lists loaded. Grows, never shrinks: the lists are C symbols, so
 // their textures are too, and a later scene sharing a texture shares the address.
 std::unordered_set<const void*> sMipTextures;
+// Archive textures one of those lists loaded, by path (sturdy-bassoon#171; why a path and not an
+// address: fast/TextureMips.h). Grows, never shrinks, like sMipTextures: a path names one texture
+// for good. Each carries what its last upload built, for the host's status line.
+struct MipArchiveTexture {
+    uint32_t levels = 0;
+    uint64_t uploads = 0;
+};
+std::unordered_map<std::string, MipArchiveTexture> sMipArchiveTextures;
 bool sMipsEnabled = true;
 // While the interpreter is inside a scoped list: the command-stack depth that list runs at, so the
 // scope ends when the stack drops below it. 0 = outside every scoped list.
@@ -102,6 +111,10 @@ void TextureMipsRegisterDisplayList(const void* displayList) {
     if (displayList != nullptr) {
         sMipScopeLists.insert(displayList);
     }
+}
+
+void TextureMipsUnregisterDisplayList(const void* displayList) {
+    sMipScopeLists.erase(displayList);
 }
 
 void TextureMipsSetEnabled(bool enabled) {
@@ -1451,16 +1464,30 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
 
     // One of the host's own textures gets a mip chain on this upload (sturdy-bassoon#146). Cleared on
     // the way out whichever return is taken, so no other upload inherits it. A replacement import
-    // (a texture pack's mask) is never ours.
+    // (a texture pack's mask) is never ours. An archive texture is looked up by path (#171), and what
+    // the upload built is noted on it whether or not the switch asked for a chain.
+    MipArchiveTexture* archive = nullptr;
+    if (!importReplacement && metadata->resource != nullptr && !sMipArchiveTextures.empty()) {
+        auto found = sMipArchiveTextures.find(metadata->resource->GetInitData()->Path);
+        archive = found != sMipArchiveTextures.end() ? &found->second : nullptr;
+    }
     struct MipNote {
         GfxRenderingAPI* rapi;
         bool on;
+        MipArchiveTexture* archive;
+        uint64_t uploadsBefore;
         ~MipNote() {
             if (on) {
                 rapi->SetNextUploadMipmaps(false);
             }
+            if (archive != nullptr && rapi->TexturesUploaded() != uploadsBefore) {
+                archive->uploads++;
+                archive->levels = rapi->LastUploadLevels();
+            }
         }
-    } mipNote{ mRapi, sMipsEnabled && !importReplacement && sMipTextures.contains(origAddr) };
+    } mipNote{ mRapi,
+               sMipsEnabled && !importReplacement && (archive != nullptr || sMipTextures.contains(origAddr)),
+               archive, mRapi->TexturesUploaded() };
     if (mipNote.on) {
         mRapi->SetNextUploadMipmaps(true);
     }
@@ -4260,6 +4287,22 @@ static bool IsValidResolvedAddress(uintptr_t addr) {
 #endif
 }
 
+// Whether the interpreter is inside a list the host named for mipmaps (sturdy-bassoon#146).
+static bool InMipScope() {
+    return sMipScopeDepth != 0 && g_exec_stack.cmd_stack.size() >= sMipScopeDepth;
+}
+
+// An archive texture loaded inside such a list joins by path (#171), before the import that uploads
+// it. A texture pack's replacement ("alt/") does not: packs are never mipmapped.
+static void NoteMipScopeArchive(const std::shared_ptr<Fast::Texture>& texture) {
+    if (texture != nullptr && InMipScope()) {
+        const std::string& path = texture->GetInitData()->Path;
+        if (!path.starts_with(Ship::IResource::gAltAssetPrefix)) {
+            sMipArchiveTextures.try_emplace(path);
+        }
+    }
+}
+
 bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4298,10 +4341,15 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
         return false;
     }
 
-    // A raw texture (no archive resource) loaded inside a list the host named for mipmaps is one of
-    // the host's own (sturdy-bassoon#146). Collected here, before the import that uploads it.
-    if (sMipScopeDepth != 0 && rawTexMetdata.resource == nullptr && g_exec_stack.cmd_stack.size() >= sMipScopeDepth) {
-        sMipTextures.insert((const void*)i);
+    // A texture loaded inside a list the host named for mipmaps is one of the host's own
+    // (sturdy-bassoon#146). Collected here, before the import that uploads it: a raw one by address,
+    // an archive one by path (#171).
+    if (rawTexMetdata.resource == nullptr) {
+        if (InMipScope()) {
+            sMipTextures.insert((const void*)i);
+        }
+    } else {
+        NoteMipScopeArchive(rawTexMetdata.resource);
     }
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
@@ -4335,6 +4383,7 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
+        NoteMipScopeArchive(texture);
 
         // OTRTODO: We have disabled caching for now to fix a texture corruption issue with HD texture
         // support. In doing so, there is a potential performance hit since we are not caching lookups. We
@@ -4391,6 +4440,7 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.v_pixel_scale = texture->VPixelScale;
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
+        NoteMipScopeArchive(texture);
 
         uint32_t fmt = C0(21, 3);
         uint32_t size = C0(19, 2);
@@ -5814,6 +5864,17 @@ void Fast::TextureMipsGetStats(uint32_t* lists, uint32_t* addresses, uint64_t* m
         GfxRenderingAPI* rapi = gfx != nullptr ? gfx->GetCurrentRenderingAPI() : nullptr;
         *mippedUploads = rapi != nullptr ? rapi->MippedUploads() : 0;
     }
+}
+
+std::vector<Fast::TextureMipsArchiveTexture> Fast::TextureMipsGetArchiveTextures() {
+    std::vector<Fast::TextureMipsArchiveTexture> textures;
+    textures.reserve(Fast::sMipArchiveTextures.size());
+    for (const auto& kv : Fast::sMipArchiveTextures) {
+        textures.push_back({ kv.first, kv.second.levels, kv.second.uploads });
+    }
+    std::sort(textures.begin(), textures.end(),
+              [](const auto& a, const auto& b) { return a.path < b.path; });
+    return textures;
 }
 
 void Fast::TextureMipsSetLod(int mode, float bias) {

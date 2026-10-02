@@ -202,6 +202,11 @@ class GfxRenderingAPI {
     uint64_t MippedUploads() const {
         return mMippedUploads;
     }
+    // Levels the most recent UploadTexture built (1 = no chain), for the host's per-texture status
+    // (sturdy-bassoon#171). Set only by a backend that counts its uploads, like TexturesUploaded.
+    uint32_t LastUploadLevels() const {
+        return mLastUploadLevels;
+    }
 
     // Textures the backend has actually created through UploadTexture. The static bake compares it
     // across a texture-cache miss to tell an import that uploaded from one that returned early and
@@ -213,6 +218,7 @@ class GfxRenderingAPI {
   protected:
     uint64_t mTexturesUploaded = 0;
     uint64_t mMippedUploads = 0;
+    uint32_t mLastUploadLevels = 0;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
