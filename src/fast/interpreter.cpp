@@ -5872,8 +5872,7 @@ std::vector<Fast::TextureMipsArchiveTexture> Fast::TextureMipsGetArchiveTextures
     for (const auto& kv : Fast::sMipArchiveTextures) {
         textures.push_back({ kv.first, kv.second.levels, kv.second.uploads });
     }
-    std::sort(textures.begin(), textures.end(),
-              [](const auto& a, const auto& b) { return a.path < b.path; });
+    std::sort(textures.begin(), textures.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
     return textures;
 }
 

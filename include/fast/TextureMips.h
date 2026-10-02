@@ -54,7 +54,7 @@ void TextureMipsUnregisterDisplayList(const void* displayList);
 void TextureMipsSetEnabled(bool enabled);
 bool TextureMipsIsEnabled();
 
-// For the host's status line: display lists offered; raw addresses those lists have named with
+// For the host's status line: display lists offered and not withdrawn; raw addresses those lists have named with
 // G_SETTIMG (a palette's too - a TLUT load names its palette the same way - so this is an upper bound
 // on textures); and uploads that really built a chain of more than one level since boot (a
 // re-upload after a cache clear counts again).
