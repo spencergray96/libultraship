@@ -1053,7 +1053,10 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           maxLights +
           "];\n"
           "    float4 uLightColor[" +
-          maxLights + "];\n};\n\n";
+          maxLights +
+          "];\n"
+          "    float4 uUvOffset;\n" // THROWAWAY sturdy-bassoon#187: TEXEL0's scroll offset
+          "};\n\n";
 
     if (shadeMask != 0) {
         // GfxSpVertex's directional-light sum, in its own order and units: start from the ambient
@@ -1092,6 +1095,15 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
             return false;
         }
         src.insert(end + 1, "\n    if (position.w > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
+    }
+
+    // THROWAWAY sturdy-bassoon#187: TEXEL0 scrolls by the draw's offset (0 for a still texture).
+    {
+        static const char* kUv0Marker = "result.uv0 = uv0;";
+        const size_t uvAt = src.find(kUv0Marker, vsAt + cb.size());
+        if (uvAt != std::string::npos) {
+            src.replace(uvAt, strlen(kUv0Marker), "result.uv0 = uv0 + uUvOffset.xy;");
+        }
     }
 
     std::string posCode = "float4 bakeClip = mul(float4(position.xyz, 1.0), uMVP);\n"

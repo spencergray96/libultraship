@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -47,7 +49,8 @@ struct BakedDraw {
 // the same objects - so two batches with one program but different textures, or one texture under
 // different wrap or filter settings, stay separate draws.
 bool SameDrawState(const BakedDraw& a, const BakedDraw& b) {
-    return a.gpu.prg == b.gpu.prg && a.gpu.shadeMask == b.gpu.shadeMask && a.gpu.cullMode == b.gpu.cullMode &&
+    return a.gpu.uvScroll[0] == b.gpu.uvScroll[0] && a.gpu.uvScroll[1] == b.gpu.uvScroll[1] &&
+           a.gpu.prg == b.gpu.prg && a.gpu.shadeMask == b.gpu.shadeMask && a.gpu.cullMode == b.gpu.cullMode &&
            a.gpu.zmodeDecal == b.gpu.zmodeDecal && a.gpu.textures[0] == b.gpu.textures[0] &&
            a.gpu.textures[1] == b.gpu.textures[1] && a.numFloats == b.numFloats &&
            a.depthTestAndMask == b.depthTestAndMask && a.alphaBlend == b.alphaBlend && a.primDepth == b.primDepth;
@@ -88,6 +91,22 @@ const char* sAbortReason = nullptr;
 // a fresh batch. (0xFF is never a real mask: a combiner has at most 7 inputs.)
 uint8_t sRecordCull = 0xFF;
 uint8_t sRecordShadeMask = 0xFF;
+// THROWAWAY sturdy-bassoon#187: the TEXEL0 scroll rate the buffered triangles were emitted under.
+float sRecordScroll[2] = { 0.0f, 0.0f };
+std::chrono::steady_clock::time_point sRecordStart;
+uint32_t sRecordPasses = 0;
+double sRecordMs = 0.0;
+
+// THROWAWAY sturdy-bassoon#187: the texture scroll registry. Paths as registered (no __OTR__),
+// and the image data each has resolved to, which is what a texture cache key names.
+std::unordered_map<std::string, std::pair<float, float>> sScrollByPath;
+std::unordered_map<const void*, std::pair<float, float>> sScrollByAddr;
+float sScrollPinned = -1.0f;
+std::chrono::steady_clock::time_point sScrollEpoch = std::chrono::steady_clock::now();
+
+const char* StripOtr(const char* path) {
+    return strncmp(path, "__OTR__", 7) == 0 ? path + 7 : path;
+}
 
 // Opcodes the recorder understands. Anything else - a matrix load, a segment write, a branch_z -
 // means the display list is doing something the replay could not reproduce, so the bake is
@@ -216,6 +235,8 @@ void BeginRecording(Interpreter* gfx, const void* key, Entry& e) {
     sAbortReason = nullptr;
     sRecordCull = 0xFF;
     sRecordShadeMask = 0xFF;
+    sRecordScroll[0] = sRecordScroll[1] = 0.0f;
+    sRecordStart = std::chrono::steady_clock::now();
     // g_exec_stack.call() pushes exactly one frame for the display list we are about to enter.
     sRecordDepth = g_exec_stack.cmd_stack.size() + 1;
     gStaticBakeRecording = true;
@@ -291,6 +312,13 @@ void Replay(Interpreter* gfx, Entry& e) {
     for (const BakedDraw& d : e.draws) {
         const bool depthTest = (d.depthTestAndMask & 1) != 0;
         const bool depthMask = (d.depthTestAndMask & 2) != 0;
+        // THROWAWAY sturdy-bassoon#187: a scrolling draw's offset now; 0 otherwise. The backend
+        // uploads the constant buffer only when this changes it.
+        if (d.gpu.uvScroll[0] != 0.0f || d.gpu.uvScroll[1] != 0.0f) {
+            StaticBakeScrollOffset(d.gpu.uvScroll, u.uvOffset);
+        } else {
+            u.uvOffset[0] = u.uvOffset[1] = 0.0f;
+        }
         if (d.depthTestAndMask != gfx->mRenderingState.depth_test_and_mask) {
             gfx->mRapi->SetDepthTestAndMask(depthTest, depthMask);
             gfx->mRenderingState.depth_test_and_mask = d.depthTestAndMask;
@@ -432,6 +460,14 @@ void FinishRecording(Interpreter* gfx) {
 
     Entry* e = sRecording;
     const void* key = sRecordingKey;
+    // THROWAWAY sturdy-bassoon#187: the record pass's wall time, walk to upload, for the report.
+    struct RecordTimer {
+        ~RecordTimer() {
+            sRecordPasses++;
+            sRecordMs +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sRecordStart).count();
+        }
+    } recordTimer;
     if (e == nullptr) {
         sRecordingKey = nullptr;
         return;
@@ -624,6 +660,72 @@ StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
     return info;
 }
 
+void StaticBakeSetTextureScroll(const char* path, float du, float dv) {
+    if (path == nullptr) {
+        return;
+    }
+    const std::string key = StripOtr(path);
+    if (du == 0.0f && dv == 0.0f) {
+        sScrollByPath.erase(key);
+    } else {
+        sScrollByPath[key] = { du, dv };
+    }
+    sScrollByAddr.clear(); // re-bound as each path next resolves
+}
+
+void StaticBakeClearTextureScrolls() {
+    sScrollByPath.clear();
+    sScrollByAddr.clear();
+}
+
+void StaticBakeSetScrollClock(float t) {
+    sScrollPinned = t;
+}
+
+bool StaticBakeScrollRate(const void* texAddr, float rate[2]) {
+    if (sScrollByAddr.empty()) {
+        return false;
+    }
+    auto it = sScrollByAddr.find(texAddr);
+    if (it == sScrollByAddr.end()) {
+        return false;
+    }
+    rate[0] = it->second.first;
+    rate[1] = it->second.second;
+    return true;
+}
+
+void StaticBakeScrollOffset(const float rate[2], float out[2]) {
+    const double t = sScrollPinned >= 0.0f
+                         ? (double)sScrollPinned
+                         : std::chrono::duration<double>(std::chrono::steady_clock::now() - sScrollEpoch).count();
+    for (int i = 0; i < 2; i++) {
+        const double x = (double)rate[i] * t;
+        out[i] = (float)(x - std::floor(x));
+    }
+}
+
+void StaticBakeNoteTexturePath(const char* path, const void* imageData) {
+    if (sScrollByPath.empty() || path == nullptr || imageData == nullptr) {
+        return;
+    }
+    auto it = sScrollByPath.find(StripOtr(path));
+    if (it != sScrollByPath.end()) {
+        sScrollByAddr[imageData] = it->second;
+    }
+}
+
+void StaticBakeTakeRecordTime(uint32_t* passes, double* ms) {
+    if (passes != nullptr) {
+        *passes = sRecordPasses;
+    }
+    if (ms != nullptr) {
+        *ms = sRecordMs;
+    }
+    sRecordPasses = 0;
+    sRecordMs = 0.0;
+}
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API
 // ---------------------------------------------------------------------------
@@ -712,6 +814,8 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     d.depthTestAndMask = depthTestAndMask;
     d.alphaBlend = alphaBlend;
     d.primDepth = primDepth;
+    d.gpu.uvScroll[0] = sRecordScroll[0];
+    d.gpu.uvScroll[1] = sRecordScroll[1];
 
     // Hold the textures the batch was drawn with, for every slot the program samples. What the
     // backend has bound right now is this batch's: GfxSpTri1 flushes before it imports a texture
@@ -839,10 +943,18 @@ void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& m) {
     // change; only which input is fed the vertex colour did). The replay shader lights a fixed
     // input, so one baked draw can only have one mask.
     const uint8_t cull = m.cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : m.cullCode;
-    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask) {
+    // THROWAWAY sturdy-bassoon#187: the scroll rate of the texture TEXEL0 reads, closed the same way.
+    float scroll[2] = { 0.0f, 0.0f };
+    if (m.combTextures[0] && gfx->mRenderingState.mTextures[0] != nullptr) {
+        StaticBakeScrollRate(gfx->mRenderingState.mTextures[0]->first.texture_addr, scroll);
+    }
+    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask || scroll[0] != sRecordScroll[0] ||
+        scroll[1] != sRecordScroll[1]) {
         gfx->Flush(); // captures what is buffered under the *previous* mode and mask
         sRecordCull = cull;
         sRecordShadeMask = m.shadeMask;
+        sRecordScroll[0] = scroll[0];
+        sRecordScroll[1] = scroll[1];
     }
 }
 
@@ -902,6 +1014,28 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 
 StaticBakeEntryInfo StaticBakeGetEntry(const void*) {
     return {};
+}
+void StaticBakeSetTextureScroll(const char*, float, float) {
+}
+void StaticBakeClearTextureScrolls() {
+}
+void StaticBakeSetScrollClock(float) {
+}
+bool StaticBakeScrollRate(const void*, float*) {
+    return false;
+}
+void StaticBakeScrollOffset(const float*, float* out) {
+    out[0] = out[1] = 0.0f;
+}
+void StaticBakeNoteTexturePath(const char*, const void*) {
+}
+void StaticBakeTakeRecordTime(uint32_t* passes, double* ms) {
+    if (passes != nullptr) {
+        *passes = 0;
+    }
+    if (ms != nullptr) {
+        *ms = 0.0;
+    }
 }
 
 } // namespace Fast

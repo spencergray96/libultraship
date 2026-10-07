@@ -59,6 +59,8 @@ struct StaticBakeUniforms {
     float ambient[4];
     float lightDir[STATIC_BAKE_MAX_DIR_LIGHTS][4];
     float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
+    // THROWAWAY sturdy-bassoon#187: this draw's TEXEL0 scroll offset, in texture widths (xy).
+    float uvOffset[4];
 };
 
 // Texture slots a baked draw can bind: TEXEL0 and TEXEL1. The HD mask and blend slots behind them
@@ -78,6 +80,8 @@ struct StaticBakeDraw {
     // HoldStaticTexture handles, one per slot the program samples, taken when the draw was recorded.
     // 0 binds no texture to that slot.
     uint32_t textures[STATIC_BAKE_TEXTURE_SLOTS];
+    // THROWAWAY sturdy-bassoon#187: TEXEL0's scroll rate, texture widths a second; 0 for none.
+    float uvScroll[2];
 };
 
 // A hash function used to hash a: pair<float, float>

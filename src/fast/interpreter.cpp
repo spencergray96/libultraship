@@ -2391,6 +2391,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
+#ifdef ENABLE_STATIC_BAKE
+            // THROWAWAY sturdy-bassoon#187: an interpreted scrolling texture takes its offset here; a
+            // recording keeps the raw UVs, and the replay adds it.
+            float scrollRate[2];
+            if (t == 0 && !bakeRecording && mRenderingState.mTextures[0] != nullptr &&
+                StaticBakeScrollRate(mRenderingState.mTextures[0]->first.texture_addr, scrollRate)) {
+                float off[2];
+                StaticBakeScrollOffset(scrollRate, off);
+                u += off[0] * tex_width[t];
+                v += off[1] * tex_height[t];
+            }
+#endif
             mBufVbo[mBufVboLen++] = u / tex_width[t];
             mBufVbo[mBufVboLen++] = v / tex_height[t];
 
@@ -4441,6 +4453,9 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
         NoteMipScopeArchive(texture);
+#ifdef ENABLE_STATIC_BAKE
+        StaticBakeNoteTexturePath(fileName, texture->ImageData); // THROWAWAY sturdy-bassoon#187
+#endif
 
         uint32_t fmt = C0(21, 3);
         uint32_t size = C0(19, 2);

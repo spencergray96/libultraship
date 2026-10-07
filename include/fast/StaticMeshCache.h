@@ -105,6 +105,24 @@ struct StaticBakeEntryInfo {
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
 
+// THROWAWAY (sturdy-bassoon#187 route A): a texture that scrolls, as RS's do. A texture registered
+// by archive path scrolls at (du, dv) texture widths a second wherever it is drawn: a baked draw
+// carries the rate and the replay adds the offset in its vertex stage; an interpreted draw adds it
+// to the UVs it writes. Rates of 0 remove it. Registering re-records nothing: the rate is read at
+// record time, so register before the list first draws.
+void StaticBakeSetTextureScroll(const char* path, float du, float dv);
+void StaticBakeClearTextureScrolls();
+// Pin the scroll clock at t seconds (t >= 0, for same-picture comparisons), or let it run (t < 0).
+void StaticBakeSetScrollClock(float t);
+// The scroll rate of the texture whose image data is at addr; false when it does not scroll.
+bool StaticBakeScrollRate(const void* texAddr, float rate[2]);
+// The offset to add now for a rate: frac(rate * clock).
+void StaticBakeScrollOffset(const float rate[2], float out[2]);
+// From the G_SETTIMG_OTR_FILEPATH handler: binds a registered path to the image data it resolved to.
+void StaticBakeNoteTexturePath(const char* path, const void* imageData);
+// Record passes and their total wall time since the last call, for the host's report.
+void StaticBakeTakeRecordTime(uint32_t* passes, double* ms);
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------
