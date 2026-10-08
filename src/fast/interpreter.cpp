@@ -1754,7 +1754,20 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
-void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices, bool archiveFlags) {
+#ifdef ENABLE_STATIC_BAKE
+    // Wind in the replay (sturdy-bassoon#209 W1). Only an archive's vertices are decoded (the guard:
+    // fast/StaticMeshCache.h). A record pass notes each weighted vertex's code and keeps its position
+    // raw, for the replay shader to bend; anything drawn here bends now, by the shader's formula, from
+    // the vectors for this modelview - worked out on the first weighted vertex and kept until the
+    // modelview, the frame or the wind changes, not on every vertex load.
+    const bool windDecode = archiveFlags && (gStaticBakeRecording || gStaticBakeWindOn);
+    const bool windBend = windDecode && !gStaticBakeRecording;
+    const float* windK = nullptr;
+    const float* windB = nullptr;
+    float windFaceScale = 0.0f;
+    uint32_t windVertices = 0;
+#endif
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1764,21 +1777,63 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             return;
         }
 
-        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
-                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
-        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
-                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
-        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
-                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
-        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
-                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+        float ob[3] = { (float)v->ob[0], (float)v->ob[1], (float)v->ob[2] };
+        d->windCode = 0;
+#ifdef ENABLE_STATIC_BAKE
+        if (windDecode) {
+            const uint16_t code = StaticBakeWindCode(v->flag);
+            if (code != 0) {
+                windVertices++;
+                if (!windBend) {
+                    d->windCode = code;
+                } else {
+                    if (windK == nullptr) {
+                        const float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+                        if (!mWindVectorsValid || mWindVectorsGeneration != gStaticBakeWindGeneration ||
+                            memcmp(mWindVectorsModelview, mv, sizeof(mWindVectorsModelview)) != 0) {
+                            StaticBakeWindVectors(mv, mWindK, mWindB, true);
+                            memcpy(mWindVectorsModelview, mv, sizeof(mWindVectorsModelview));
+                            mWindVectorsGeneration = gStaticBakeWindGeneration;
+                            mWindVectorsValid = true;
+                        }
+                        windK = mWindK;
+                        windB = mWindB;
+                        windFaceScale = sqrtf(windB[0] * windB[0] + windB[1] * windB[1] + windB[2] * windB[2]);
+                    }
+                    const uint32_t direction = code >> 8;
+                    const float wt = (float)(code & 0xFF) * (1.0f / 255.0f);
+                    float bend[3] = { windB[0], windB[1], windB[2] };
+                    if (direction != 0) {
+                        StaticBakeWindDirection(direction, bend);
+                        for (int c = 0; c < 3; c++) {
+                            bend[c] *= windFaceScale;
+                        }
+                    }
+                    const float s =
+                        wt * sinf(windK[0] * ob[0] + windK[1] * ob[1] + windK[2] * ob[2] + windK[3] + windB[3] * wt);
+                    for (int c = 0; c < 3; c++) {
+                        ob[c] += bend[c] * s;
+                    }
+                }
+            }
+        }
+#endif
+
+        float x = ob[0] * mRsp->MP_matrix[0][0] + ob[1] * mRsp->MP_matrix[1][0] + ob[2] * mRsp->MP_matrix[2][0] +
+                  mRsp->MP_matrix[3][0];
+        float y = ob[0] * mRsp->MP_matrix[0][1] + ob[1] * mRsp->MP_matrix[1][1] + ob[2] * mRsp->MP_matrix[2][1] +
+                  mRsp->MP_matrix[3][1];
+        float z = ob[0] * mRsp->MP_matrix[0][2] + ob[1] * mRsp->MP_matrix[1][2] + ob[2] * mRsp->MP_matrix[2][2] +
+                  mRsp->MP_matrix[3][2];
+        float w = ob[0] * mRsp->MP_matrix[0][3] + ob[1] * mRsp->MP_matrix[1][3] + ob[2] * mRsp->MP_matrix[2][3] +
+                  mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-            world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
-            world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
-            world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+            world_pos[0] = ob[0] * mtx[0][0] + ob[1] * mtx[1][0] + ob[2] * mtx[2][0] + mtx[3][0];
+            world_pos[1] = ob[0] * mtx[0][1] + ob[1] * mtx[1][1] + ob[2] * mtx[2][1] + mtx[3][1];
+            world_pos[2] = ob[0] * mtx[0][2] + ob[1] * mtx[1][2] + ob[2] * mtx[2][2] + mtx[3][2];
         }
 
         x = AdjXForAspectRatio(x);
@@ -1958,6 +2013,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.a = v->cn[3];
         }
     }
+#ifdef ENABLE_STATIC_BAKE
+    if (windVertices != 0) {
+        StaticBakeNoteWindVertices(windVertices);
+    }
+#endif
 }
 
 void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t val) {
@@ -2366,7 +2426,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mBufVbo[mBufVboLen++] = v_arr[i]->x;
         mBufVbo[mBufVboLen++] = (clip_parameters.invertY && !bakeRecording) ? -v_arr[i]->y : v_arr[i]->y;
         mBufVbo[mBufVboLen++] = z;
-        mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
+        // And the wind (#209 W1): a weighted vertex's code rides on top, w + 4 x code, for the replay
+        // shader to bend it. Every other vertex records exactly the w it did before wind existed.
+        if (bakeRecording && !is_rect && v_arr[i]->windCode != 0) {
+            mBufVbo[mBufVboLen++] =
+                (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)v_arr[i]->windCode;
+        } else {
+            mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
+        }
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -3948,8 +4015,13 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     size_t vtxCnt = cmd->words.w0;
     size_t vtxIdxOff = cmd->words.w1 >> 16;
     size_t vtxDataOff = cmd->words.w1 & 0xFFFF;
-    F3DVtx* vtx =
-        (F3DVtx*)Ship::Context::GetRawInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
+    // The resource, not only its data: an XML vertex resource is an archive's, the only kind whose
+    // flags may carry wind (sturdy-bassoon#209 W1, the guard in fast/StaticMeshCache.h).
+    auto resourceManager = Ship::Context::GetRawInstance()->GetResourceManager();
+    std::shared_ptr<Ship::IResource> vtxResource = resourceManager->LoadResource((const char*)fileName);
+    F3DVtx* vtx = (F3DVtx*)resourceManager->GetResourceRawPointer(vtxResource);
+    const bool archiveFlags = vtxResource != nullptr && vtxResource->GetInitData() != nullptr &&
+                              vtxResource->GetInitData()->Format == RESOURCE_FORMAT_XML;
     if (vtx == nullptr) {
         // A path that resolves to nothing loads no vertices. Before this check it handed GfxSpVertex
         // a pointer just past null. A bake being recorded is refused rather than frozen with the
@@ -3963,7 +4035,7 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     }
     vtx += vtxDataOff;
 
-    gfx->GfxSpVertex(vtxCnt, vtxIdxOff, vtx);
+    gfx->GfxSpVertex(vtxCnt, vtxIdxOff, vtx, archiveFlags);
     return false;
 }
 

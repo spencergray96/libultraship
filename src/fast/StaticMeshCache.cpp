@@ -17,6 +17,8 @@ namespace Fast {
 
 bool gStaticBakeRecording = false;
 bool gStaticBakeScrollsBound = false;
+bool gStaticBakeWindOn = StaticBakeWind{}.amplitude != 0.0f;
+uint32_t gStaticBakeWindGeneration = 0;
 
 namespace {
 
@@ -75,6 +77,10 @@ struct Entry {
     std::vector<BakedDraw> draws;
     uint32_t buffer = 0;
     size_t totalTris = 0;
+    // Wind (#209 W1): the weighted vertices the recording loaded, and the triangles with a weighted
+    // corner. A list with none replays with the wind registers at 0, as it did before wind existed.
+    uint32_t windVertices = 0;
+    uint32_t windTris = 0;
     const char* rejectReason = nullptr; // a literal, set wherever state becomes Rejected
 };
 
@@ -167,6 +173,17 @@ void ScrollOffsetNow(const float* rate, float* out) {
     }
 }
 
+// The frame's wind (sturdy-bassoon#209 W1; the header's "Wind in the replay"), and what it did: the
+// frame being drawn counts into sWindNow, which StaticBakeBeginFrame hands to sWindLast.
+StaticBakeWind sWind;
+StaticBakeWindStats sWindNow;
+StaticBakeWindStats sWindLast;
+
+// A recorded vertex's w is (1 or 2) + 4 x its wind code, so a code is there when w reaches 4.
+bool RecordedWeighted(float w) {
+    return w >= STATIC_BAKE_WIND_W_SCALE;
+}
+
 // Opcodes the recorder understands. Anything else - a matrix load, a segment write, a branch_z -
 // means the display list is doing something the replay could not reproduce, so the bake is
 // abandoned for good rather than guessed at. Indexed by the raw opcode byte; values are F3DEX2's,
@@ -249,6 +266,8 @@ void ReleaseGpu(Entry& e) {
     e.staging.clear();
     e.staging.shrink_to_fit();
     e.totalTris = 0;
+    e.windVertices = 0;
+    e.windTris = 0;
 }
 
 void AbortRecording(Interpreter* gfx, const char* reason) {
@@ -367,10 +386,18 @@ void Replay(Interpreter* gfx, Entry& e) {
         }
     }
 
-    // What moves (#187 A1): per list entry the wind registers, which stay 0 until wind in the replay
-    // (#209) fills them; per draw TEXEL0's scroll offset, 0 for a still draw. The backend re-sends the
-    // block only when it changes, so a list with nothing scrolling sends it at most once.
+    // What moves (#187 A1): per list entry the wind registers; per draw TEXEL0's scroll offset, 0 for a
+    // still draw. The backend re-sends the block only when it changes, so a list with nothing
+    // scrolling sends it at most once.
     StaticBakeAnimUniforms anim = {};
+    // Wind (#209 W1), worked out once for the entry from its modelview: room lists run under the
+    // identity, an actor's list under the actor's matrix. Only a list that recorded a weighted vertex
+    // gets them; every other list keeps them at 0, so its buffer is exactly what it was without wind.
+    if (e.windTris != 0 && gStaticBakeWindOn && gfx->mRsp->modelview_matrix_stack_size > 0) {
+        StaticBakeWindVectors(gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1],
+                              anim.windK, anim.windB, false);
+        sWindNow.replayEntries++;
+    }
 
     for (const BakedDraw& d : e.draws) {
         if (ScrollsTexel0(d)) {
@@ -601,13 +628,13 @@ void FinishRecording(Interpreter* gfx) {
 
     e->state = BakeState::Baked;
     // The draws the list would have in list order, and what ordering it by material cost, after the
-    // fields older run scripts parse; then the scrolling draws (#187 A1), after those.
+    // fields older run scripts parse; then the scrolling draws (#187 A1), and the wind (#209 W1).
     SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures; "
-                "{} draws in list order, {}; {} scrolling draws",
+                "{} draws in list order, {}; {} scrolling draws; {} wind vertices in {} tris",
                 key, e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws,
                 held.size(), listOrderDraws,
                 sSortByMaterial ? fmt::format("sorted by material in {:.2f} ms", sortMs) : std::string("not sorted"),
-                scrollingDraws);
+                scrollingDraws, e->windVertices, e->windTris);
     e->staging.clear();
     e->staging.shrink_to_fit();
 
@@ -710,6 +737,8 @@ StaticBakeEntryInfo InfoOf(const Entry& e) {
                     info.scrollingTris += (uint32_t)d.gpu.numTris;
                 }
             }
+            info.windVertices = e.windVertices;
+            info.windTris = e.windTris;
             break;
         case BakeState::Rejected:
             info.state = StaticBakeEntryState::Rejected;
@@ -734,6 +763,17 @@ std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries() {
     for (const auto& kv : sEntries) {
         StaticBakeEntryInfo info = InfoOf(kv.second);
         if (info.scrollingDraws != 0) {
+            out.push_back({ kv.first, info });
+        }
+    }
+    return out;
+}
+
+std::vector<StaticBakeScrollingEntry> StaticBakeGetWindEntries() {
+    std::vector<StaticBakeScrollingEntry> out;
+    for (const auto& kv : sEntries) {
+        StaticBakeEntryInfo info = InfoOf(kv.second);
+        if (info.windVertices != 0 || info.windTris != 0) {
             out.push_back({ kv.first, info });
         }
     }
@@ -799,6 +839,7 @@ std::vector<StaticBakeTextureScroll> StaticBakeGetTextureScrolls() {
 void StaticBakePinClock(double seconds) {
     sClockPinned = seconds >= 0.0 ? seconds : -1.0;
     sClockNow = sClockPinned >= 0.0 ? sClockPinned : RealClockSeconds(); // from the next draw, not frame
+    gStaticBakeWindGeneration++; // the wind's phase follows the clock
 }
 
 bool StaticBakeClockIsPinned() {
@@ -807,6 +848,26 @@ bool StaticBakeClockIsPinned() {
 
 double StaticBakeClockSeconds() {
     return sClockNow;
+}
+
+bool StaticBakeSetWind(const StaticBakeWind& wind) {
+    if (!std::isfinite(wind.amplitude) || !std::isfinite(wind.frequency) || !std::isfinite(wind.wavelength) ||
+        !std::isfinite(wind.yawDeg) || !std::isfinite(wind.ripple) || wind.amplitude < 0.0f ||
+        wind.wavelength < 0.0f) {
+        return false;
+    }
+    sWind = wind;
+    gStaticBakeWindOn = sWind.amplitude != 0.0f;
+    gStaticBakeWindGeneration++;
+    return true;
+}
+
+StaticBakeWind StaticBakeGetWind() {
+    return sWind;
+}
+
+StaticBakeWindStats StaticBakeGetWindStats() {
+    return sWindLast;
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +946,14 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     const size_t byteOffset = e->staging.size() * sizeof(float);
     e->staging.insert(e->staging.end(), gfx->mBufVbo, gfx->mBufVbo + gfx->mBufVboLen);
     e->totalTris += gfx->mBufVboNumTris;
+    // The triangles that sway (#209 W1): a corner's w (its fourth float) carries its wind code.
+    for (size_t t = 0; t < gfx->mBufVboNumTris; t++) {
+        const float* tri = gfx->mBufVbo + t * 3 * floatsPerVertex;
+        if (RecordedWeighted(tri[3]) || RecordedWeighted(tri[floatsPerVertex + 3]) ||
+            RecordedWeighted(tri[2 * floatsPerVertex + 3])) {
+            e->windTris++;
+        }
+    }
 
     BakedDraw d = {};
     d.gpu.byteOffset = byteOffset;
@@ -1070,6 +1139,83 @@ void StaticBakeEndFrame(Interpreter* gfx) {
 
 void StaticBakeBeginFrame() {
     sClockNow = sClockPinned >= 0.0 ? sClockPinned : RealClockSeconds();
+    gStaticBakeWindGeneration++; // a new clock value: every list's wind phase moves on
+    sWindLast = sWindNow;
+    sWindNow = {};
+}
+
+void StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4], bool fromInterpreter) {
+    for (int i = 0; i < 4; i++) {
+        k[i] = b[i] = 0.0f;
+    }
+    if (fromInterpreter) {
+        sWindNow.interpVectors++;
+    }
+    if (!gStaticBakeWindOn) {
+        return;
+    }
+    constexpr double kTau = 6.283185307179586;
+    const double yaw = (double)sWind.yawDeg * kTau / 360.0;
+    const double dir[3] = { std::sin(yaw), 0.0, std::cos(yaw) };
+    const double waveNumber = sWind.wavelength > 0.0f ? kTau / (double)sWind.wavelength : 0.0;
+
+    // The bend along the wind: the object-space vector whose image under M is amplitude x dir, so
+    // b = (amplitude x dir) M^-1. A matrix that cannot be inverted (a list squashed flat) bends nothing.
+    const double m00 = mv[0][0], m01 = mv[0][1], m02 = mv[0][2];
+    const double m10 = mv[1][0], m11 = mv[1][1], m12 = mv[1][2];
+    const double m20 = mv[2][0], m21 = mv[2][1], m22 = mv[2][2];
+    const double det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20) + m02 * (m10 * m21 - m11 * m20);
+    if (!(std::fabs(det) > 1e-12)) {
+        return;
+    }
+    const double inv[3][3] = {
+        { (m11 * m22 - m12 * m21) / det, (m02 * m21 - m01 * m22) / det, (m01 * m12 - m02 * m11) / det },
+        { (m12 * m20 - m10 * m22) / det, (m00 * m22 - m02 * m20) / det, (m02 * m10 - m00 * m12) / det },
+        { (m10 * m21 - m11 * m20) / det, (m01 * m20 - m00 * m21) / det, (m00 * m11 - m01 * m10) / det },
+    };
+    for (int j = 0; j < 3; j++) {
+        double s = 0.0;
+        for (int i = 0; i < 3; i++) {
+            s += (double)sWind.amplitude * dir[i] * inv[i][j];
+        }
+        b[j] = (float)s;
+    }
+    b[3] = sWind.ripple;
+
+    // The wave: world = p M + T (row vectors, as GfxSpVertex multiplies), so K . world = (M K) . p + K . T.
+    // It travels along the wind, sin(2 pi f t - K . world): the object-space vector is -(M K), and the
+    // phase takes K . T. Both reduced in double, so the phase stays small however long the session runs
+    // and wherever the list stands.
+    double kDotT = 0.0;
+    for (int i = 0; i < 3; i++) {
+        double s = 0.0;
+        for (int j = 0; j < 3; j++) {
+            s += (double)mv[i][j] * dir[j] * waveNumber;
+        }
+        k[i] = (float)-s;
+        kDotT += dir[i] * waveNumber * (double)mv[3][i];
+    }
+    const double cycles = (double)sWind.frequency * sClockNow;
+    const double phase = kTau * (cycles - std::floor(cycles)) - std::fmod(kDotT, kTau);
+    k[3] = (float)phase;
+}
+
+void StaticBakeWindDirection(uint32_t directionCode, float out[3]) {
+    // (code - 1) x pi / 127, in float, as the replay shader computes it.
+    const float a = (float)(directionCode - 1) * (3.14159265f / (float)STATIC_BAKE_WIND_DIRECTIONS);
+    out[0] = sinf(a);
+    out[1] = 0.0f;
+    out[2] = cosf(a);
+}
+
+void StaticBakeNoteWindVertices(uint32_t n) {
+    if (gStaticBakeRecording) {
+        if (sRecording != nullptr && !sRecordAborted) {
+            sRecording->windVertices += n;
+        }
+    } else {
+        sWindNow.interpVertices += n;
+    }
 }
 
 void StaticBakeNoteTexture(const char* path, const void* imageData, const std::shared_ptr<Texture>& owner) {
@@ -1111,6 +1257,8 @@ namespace Fast {
 
 bool gStaticBakeRecording = false;
 bool gStaticBakeScrollsBound = false;
+bool gStaticBakeWindOn = false;
+uint32_t gStaticBakeWindGeneration = 0;
 
 void StaticBakeSetEnabled(bool) {
 }
@@ -1145,6 +1293,18 @@ StaticBakeEntryInfo StaticBakeGetEntry(const void*) {
 }
 
 std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries() {
+    return {};
+}
+std::vector<StaticBakeScrollingEntry> StaticBakeGetWindEntries() {
+    return {};
+}
+bool StaticBakeSetWind(const StaticBakeWind&) {
+    return false;
+}
+StaticBakeWind StaticBakeGetWind() {
+    return {};
+}
+StaticBakeWindStats StaticBakeGetWindStats() {
     return {};
 }
 bool StaticBakeSetTextureScroll(const char*, float, float) {

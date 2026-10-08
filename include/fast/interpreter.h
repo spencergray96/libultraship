@@ -232,6 +232,9 @@ struct LoadedVertex {
     // shader can light the vertex under whatever lights are current.
     bool lit;
     int8_t normal[3];
+    // Wind in the replay (sturdy-bassoon#209 W1): the wind code (StaticBakeWindCode) a record pass
+    // carries into the recording's w, 0 for a vertex without wind and outside a record pass.
+    uint16_t windCode;
 };
 
 struct RawTexMetadata {
@@ -461,7 +464,9 @@ class Interpreter {
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
-    void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
+    // `archiveFlags`: the vertices came from an archive's XML vertex resource, whose flags may carry
+    // wind (fast/StaticMeshCache.h, "Wind in the replay"); no other vertex's flag is ever read.
+    void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices, bool archiveFlags = false);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
@@ -550,6 +555,13 @@ class Interpreter {
     float* mBufVbo; // 3 vertices in a triangle and 32 floats per vtx
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
+    // Wind in the replay (sturdy-bassoon#209 W1): the vectors GfxSpVertex last worked out
+    // (StaticBakeWindVectors), and the modelview and wind generation they were for.
+    bool mWindVectorsValid = false;
+    uint32_t mWindVectorsGeneration = 0;
+    float mWindVectorsModelview[4][4]{};
+    float mWindK[4]{};
+    float mWindB[4]{};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
     std::shared_ptr<GfxDebugger> mGfxDebugger;

@@ -107,8 +107,9 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 // (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
 // and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them whose TEXEL0
 // was recorded with a scroll rate, the draws that move (#187 A1; a rate on TEXEL1 alone is stamped but
-// not applied, so not counted). `rejectReason` is a string literal naming why the recorder refused it,
-// nullptr unless Rejected.
+// not applied, so not counted). `windVertices` and `windTris` (#209 W1): the weighted vertices its
+// recording loaded, and the triangles with at least one weighted corner, the part that sways.
+// `rejectReason` is a string literal naming why the recorder refused it, nullptr unless Rejected.
 enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
 struct StaticBakeEntryInfo {
     StaticBakeEntryState state = StaticBakeEntryState::NotRegistered;
@@ -116,6 +117,8 @@ struct StaticBakeEntryInfo {
     uint32_t tris = 0;
     uint32_t scrollingDraws = 0;
     uint32_t scrollingTris = 0;
+    uint32_t windVertices = 0;
+    uint32_t windTris = 0;
     const char* rejectReason = nullptr;
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
@@ -190,6 +193,99 @@ bool StaticBakeClockIsPinned();
 double StaticBakeClockSeconds();
 
 // ---------------------------------------------------------------------------
+// Wind in the replay (sturdy-bassoon#209 W1)
+//
+// A vertex that carries a wind weight bends by a sine of time and world position, the scroll's trick
+// applied to positions: the recording stays as it is and the replay's vertex stage moves the vertex,
+// so a swaying banner or field of wheat stays in a map's baked list, with no actor and no animation
+// data. With weight w (0-1) and bend vector B,
+//
+//     p' = p + B x w x sin(2 pi f t - K . world(p) + ripple x w)
+//
+// where K is the wind's direction times 2 pi over the wavelength, so the wave travels across the world
+// and neighbouring placements sway out of step, and the ripple lags the hem behind the top.
+//
+// THE CARRIER is Vtx_t.flag, which the RSP ignores (see the STATIC_BAKE_WIND_FLAG_* constants): a
+// marker bit, a bend direction and the weight. An archive's XML vertex reads it from its `Flag`
+// attribute; nothing else is ever decoded (THE GUARD, below). A recording keeps the raw position and
+// carries the code in position.w as (1 or 2) + STATIC_BAKE_WIND_W_SCALE x code, so no vertex attribute
+// is added and vertex alpha is untouched.
+//
+// THE GUARD: only vertices loaded from an XML vertex resource (an archive's, G_VTX_OTR_FILEPATH) can
+// bend. Vanilla vertices (binary resources, whose flag is passed through from the ROM data) and
+// compiled-in ones (raw G_VTX; Fast64 writes packed normals into the flag) are never decoded, whatever
+// their flag holds. And the XML reader keeps a Flag only in the marker's form, so an archive written
+// before this existed, or by another tool, loads with every flag 0, as it always did.
+//
+// THE PARAMETERS belong to the frame, not to a recording: amplitude, frequency, wavelength, direction
+// and ripple (StaticBakeWind), and the clock (StaticBakeClockSeconds, the scroll's, pinnable). Nothing
+// but the weight is read at record time, so a change needs no rebake. A host sets them from its
+// settings, and code can change them at any time (a scripted gust; the weather).
+//
+// THE BEND DIRECTION is the vertex's: along the frame's wind direction (direction code 0, wheat and
+// trees), or along a fixed horizontal line of the list's own space (codes 1-127, the cloth's own
+// normal for a flag or banner). In a map's list every placement is pre-transformed, so that line is
+// written per vertex, turned with its placement. Either way the bend moves `amplitude` world units at
+// weight 1.
+//
+// NOT GATED: like the scroll, wind does not wait for StaticBakeSetEnabled(true). With the bake off, or
+// on a backend that cannot bake, the interpreter bends the same vertices by the same formula, so a
+// baked frame and an interpreted one are the same picture.
+// ---------------------------------------------------------------------------
+
+// Vtx_t.flag, as an archive's XML `Flag` attribute writes it:
+//   bit 15      STATIC_BAKE_WIND_FLAG_MARK: the vertex carries wind
+//   bits 8-14   the bend direction: 0 = along the wind; d = 1-127 = the horizontal line at angle
+//               (d - 1) x 180 / 127 degrees from the list's +z towards +x (OoT's yaw: x = sin, z = cos).
+//               A line, not an arrow: a bend is a sine, so the opposite direction is the same sway
+//               half a period apart.
+//   bits 0-7    the weight q, 1-255 (w = q / 255): 0 at what holds the vertex still, 255 at the hem
+// A flag without the marker, or with q = 0, is no wind at all.
+constexpr uint16_t STATIC_BAKE_WIND_FLAG_MARK = 0x8000;
+constexpr int STATIC_BAKE_WIND_FLAG_DIR_SHIFT = 8;
+constexpr uint16_t STATIC_BAKE_WIND_FLAG_WEIGHT_MASK = 0x00FF;
+constexpr int STATIC_BAKE_WIND_DIRECTIONS = 127; // codes 1-127 split 180 degrees
+
+// The code a flag carries into a recording: q + 256 x direction, 1-32767; 0 when it carries no wind.
+constexpr uint16_t StaticBakeWindCode(uint16_t flag) {
+    return ((flag & STATIC_BAKE_WIND_FLAG_MARK) != 0 && (flag & STATIC_BAKE_WIND_FLAG_WEIGHT_MASK) != 0)
+               ? (uint16_t)(flag & 0x7FFF)
+               : (uint16_t)0;
+}
+
+// The frame's wind. The defaults are the owner's pick after sturdy-bassoon#208: 6 units of swing at
+// the hem (RS's own size of motion; 9 and more show the gaps between a banner's cloth strips), RS's
+// 0.94 s loop, a 400-unit wave, and a ripple of 1.5 radians down the cloth.
+struct StaticBakeWind {
+    float amplitude = 6.0f;    // world units of swing at weight 1; 0 bends nothing
+    float frequency = 1.0638f; // Hz
+    float wavelength = 400.0f; // world units; 0 = every placement in step
+    float yawDeg = 0.0f;       // where it blows to, as OoT's yaw (degrees): x = sin, z = cos
+    float ripple = 1.5f;       // radians of phase the hem (weight 1) lags behind weight 0
+};
+// Set the frame's wind, from the next vertex drawn. Refused (false, nothing changed) when a value is
+// not finite, or the amplitude or wavelength is negative. Safe at any time on the game thread: a host's
+// settings at startup, a console, a scripted gust.
+bool StaticBakeSetWind(const StaticBakeWind& wind);
+StaticBakeWind StaticBakeGetWind();
+
+// Every baked entry with at least one weighted vertex, keyed as registered (`staticbake props`).
+std::vector<StaticBakeScrollingEntry> StaticBakeGetWindEntries();
+
+// What the wind did in the last whole frame drawn, for a host's report and for checks:
+//   replayEntries   baked list entries replayed with wind vectors (a list holding weighted vertices
+//                   while the amplitude is non-zero)
+//   interpVertices  weighted vertices the interpreter bent (none of them baked)
+//   interpVectors   times the interpreter worked out the wind vectors: once per list modelview it met
+//                   with a weighted vertex in it, not once per vertex load
+struct StaticBakeWindStats {
+    uint32_t replayEntries = 0;
+    uint32_t interpVertices = 0;
+    uint32_t interpVectors = 0;
+};
+StaticBakeWindStats StaticBakeGetWindStats();
+
+// ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------
 
@@ -262,5 +358,31 @@ void StaticBakeNoteTexture(const char* path, const void* imageData, const std::s
 // The offset to add now, in texture widths and heights, to the coordinates of a triangle whose TEXEL0
 // is the image data at `imageData`; false (and `out` untouched) when that texture does not scroll.
 bool StaticBakeTextureScrollOffset(const void* imageData, float out[2]);
+
+// Wind, the interpreter's side (#209 W1).
+//
+// True while the amplitude is non-zero: the gate on the interpreter's bend. A record pass notes the
+// weights whatever it is, because the amplitude is read at replay.
+extern bool gStaticBakeWindOn;
+// Bumped whenever the vectors below would come out different for the same modelview: each frame (the
+// clock) and each StaticBakeSetWind. The interpreter keeps the vectors it last worked out, with the
+// generation and the modelview they were for, and works them out again only when either changes.
+extern uint32_t gStaticBakeWindGeneration;
+// The two vectors the replay shader and the interpreter bend by, for a list drawn under modelview
+// `mv` (row vectors, world = p M + T, as GfxSpVertex multiplies) at this frame's clock:
+//   k: xyz the wave vector in the list's own space, -(M K); w the phase now, 2 pi f t - K . T,
+//      reduced into (-2 pi, 2 pi)
+//   b: xyz the bend at weight 1 along the wind, in the list's own space, (amplitude x dir) M^-1, so it
+//      moves `amplitude` world units; w the ripple. A vertex with its own direction bends by |b.xyz|
+//      along that direction instead: the same world length under a turned and uniformly scaled matrix.
+// All zero while the amplitude is 0, or under a matrix that cannot be inverted. `fromInterpreter`
+// counts it in StaticBakeWindStats::interpVectors.
+void StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4], bool fromInterpreter);
+// The unit bend direction of a vertex's direction code (1-127), as the replay shader computes it:
+// (sin a, 0, cos a) with a = (code - 1) x pi / 127.
+void StaticBakeWindDirection(uint32_t directionCode, float out[3]);
+// From GfxSpVertex: in a record pass, `n` weighted vertices were loaded into the list being recorded;
+// otherwise, `n` weighted vertices were bent on the CPU.
+void StaticBakeNoteWindVertices(uint32_t n);
 
 } // namespace Fast

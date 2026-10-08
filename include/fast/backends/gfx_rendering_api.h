@@ -39,10 +39,10 @@ constexpr int STATIC_BAKE_MAX_DIR_LIGHTS = 7;
 // rebuilds w from the camera, so the slot is free.
 constexpr float STATIC_BAKE_LIT_W = 2.0f;
 
-// Reserved for wind in the replay (sturdy-bassoon#209): a recorded w of (1 or STATIC_BAKE_LIT_W) +
-// STATIC_BAKE_WIND_W_SCALE * q carries a vertex's wind weight q (0-255), exact in a float, so the lit
-// flag is w mod this. Nothing records a q yet, so every w is still 1 or 2 and the replay shader's
-// bend never runs.
+// Wind in the replay (sturdy-bassoon#209 W1): a recorded w of (1 or STATIC_BAKE_LIT_W) +
+// STATIC_BAKE_WIND_W_SCALE x code carries a vertex's wind code (StaticBakeWindCode in
+// fast/StaticMeshCache.h: q + 256 x direction, 0-32767; at most 131070, exact in a float), so the lit
+// flag is w mod this. A vertex without wind records w = 1 or 2, exactly as before wind existed.
 constexpr float STATIC_BAKE_WIND_W_SCALE = 4.0f;
 
 // Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the
@@ -78,9 +78,10 @@ struct StaticBakeAnimUniforms {
     // Per draw. xy: the offset added to TEXEL0's texture coordinate, frac(rate x clock), in texture
     // widths and heights. zw: TEXEL1's, reserved for several textures a prop (#201); 0 until then.
     float uvOffset[4];
-    // Per list entry, reserved for wind in the replay (#209); 0 until then, which bends nothing.
-    // windK: xyz the wave vector in the list's own space, w the phase now. windB: xyz the bend at
-    // weight 1 in the list's own space, w the ripple.
+    // Per list entry, wind in the replay (#209 W1; StaticBakeWindVectors). windK: xyz the wave vector
+    // in the list's own space, w the phase now. windB: xyz the bend at weight 1 along the wind in the
+    // list's own space, w the ripple. 0 for a list with no weighted vertex, or with the amplitude 0,
+    // which bends nothing and keeps such a list's buffer exactly what it was before wind.
     float windK[4];
     float windB[4];
 };

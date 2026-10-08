@@ -1,5 +1,6 @@
 #include "fast/resource/factory/VertexFactory.h"
 #include "fast/resource/type/Vertex.h"
+#include "fast/StaticMeshCache.h"
 #include "spdlog/spdlog.h"
 #include "libultraship/libultra/gbi.h"
 #include <tinyxml2.h>
@@ -56,7 +57,11 @@ ResourceFactoryXMLVertexV0::ReadResource(std::shared_ptr<Ship::File> file,
             data.v.ob[0] = child->IntAttribute("X");
             data.v.ob[1] = child->IntAttribute("Y");
             data.v.ob[2] = child->IntAttribute("Z");
-            data.v.flag = 0;
+            // An archive vertex may carry wind (sturdy-bassoon#209 W1): its Flag attribute, kept only in
+            // the marker's form (fast/StaticMeshCache.h, STATIC_BAKE_WIND_FLAG_*). Any other value loads
+            // as 0, as every flag did before, so an archive from another tool cannot bend by accident.
+            const unsigned int flag = child->UnsignedAttribute("Flag", 0);
+            data.v.flag = flag <= 0xFFFF && StaticBakeWindCode((uint16_t)flag) != 0 ? (uint16_t)flag : 0;
             data.v.tc[0] = child->IntAttribute("S");
             data.v.tc[1] = child->IntAttribute("T");
             data.v.cn[0] = child->IntAttribute("R");

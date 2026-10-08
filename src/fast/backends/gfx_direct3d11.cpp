@@ -37,6 +37,7 @@
 
 #include "fast/backends/gfx_rendering_api.h"
 #include "fast/interpreter.h"
+#include "fast/StaticMeshCache.h"
 
 #include <prism/processor.h>
 #include "ship/config/ConsoleVariable.h"
@@ -1022,8 +1023,9 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //     Only a vertex flagged lit in position.w is lit; an unlit one keeps its recorded colour;
 //   * adds the draw's scroll offset to TEXEL0's texture coordinate (sturdy-bassoon#187 A1), from the
 //     second buffer, StaticBakeAnimCB. A still draw's offset is 0;
-//   * bends a vertex that carries a wind weight in position.w, from the same buffer: reserved for
-//     wind in the replay (#209). No recording carries a weight yet, so the bend never runs.
+//   * bends a vertex that carries a wind code in position.w, from the same buffer (wind in the
+//     replay, #209 W1): along uWindB, or along its own direction at uWindB's length. A vertex
+//     recorded without wind (w = 1 or 2) is not touched.
 static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
@@ -1069,8 +1071,8 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT);
     cb += ") {\n"
           "    float4 uUvOffset;\n" // xy TEXEL0's scroll offset; zw TEXEL1's, reserved for #201
-          "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); reserved for #209
-          "    float4 uWindB;\n"    // bend at weight 1 (xyz), ripple (w); reserved for #209
+          "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); #209 W1
+          "    float4 uWindB;\n"    // bend at weight 1 along the wind (xyz), ripple (w); #209 W1
           "};\n\n";
 
     if (shadeMask != 0) {
@@ -1126,13 +1128,23 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         src.replace(uvAt, strlen(kUv0Marker), "result.uv0 = uv0 + uUvOffset.xy;");
     }
 
-    // The bend (reserved for #209): a weight q > 0 moves the vertex along uWindB by a sine of time and
-    // its position, before the camera. q is 0 for every vertex recorded today.
+    // The bend (wind in the replay, #209 W1): a vertex whose recorded w carries a wind code moves by a
+    // sine of time and its position, before the camera - GfxSpVertex's formula on the same unbent
+    // position. The code is q + 256 x direction (StaticBakeWindCode): weight q / 255; direction 0 bends
+    // along the wind (uWindB), 1-127 along that horizontal line of the list's own space at the same
+    // length. A vertex recorded without wind has code 0 and is not touched.
+    static_assert(STATIC_BAKE_WIND_DIRECTIONS == 127, "the bend below splits 180 degrees into 127 lines");
     std::string posCode = "float3 bakePos = position.xyz;\n"
-                          "    float bakeQ = floor(position.w * 0.25);\n"
-                          "    if (bakeQ > 0.0) {\n"
-                          "        float bakeWt = bakeQ / 255.0;\n"
-                          "        bakePos += uWindB.xyz * (bakeWt * sin(dot(uWindK.xyz, position.xyz) + uWindK.w + "
+                          "    float bakeCode = floor(position.w * 0.25);\n"
+                          "    if (bakeCode > 0.0) {\n"
+                          "        float bakeDir = floor(bakeCode * (1.0 / 256.0));\n"
+                          "        float bakeWt = (bakeCode - bakeDir * 256.0) * (1.0 / 255.0);\n"
+                          "        float3 bakeBend = uWindB.xyz;\n"
+                          "        if (bakeDir > 0.0) {\n"
+                          "            float bakeA = (bakeDir - 1.0) * (3.14159265 / 127.0);\n"
+                          "            bakeBend = length(uWindB.xyz) * float3(sin(bakeA), 0.0, cos(bakeA));\n"
+                          "        }\n"
+                          "        bakePos += bakeBend * (bakeWt * sin(dot(uWindK.xyz, position.xyz) + uWindK.w + "
                           "uWindB.w * bakeWt));\n"
                           "    }\n"
                           "    float4 bakeClip = mul(float4(bakePos, 1.0), uMVP);\n"
