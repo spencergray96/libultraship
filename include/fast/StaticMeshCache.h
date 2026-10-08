@@ -123,13 +123,14 @@ struct StaticBakeEntryInfo {
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
 
-// Every baked entry with at least one scrolling draw, keyed as registered, for a report that cannot
-// enumerate the lists itself (`staticbake props`, which joins these to its own lines by key).
-struct StaticBakeScrollingEntry {
+// A baked entry keyed as registered, for a report that cannot enumerate the lists itself (`staticbake
+// props`, which joins these to its own lines by key): what the listings below return.
+struct StaticBakeKeyedEntry {
     const void* key = nullptr;
     StaticBakeEntryInfo info;
 };
-std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries();
+// Every baked entry with at least one scrolling draw.
+std::vector<StaticBakeKeyedEntry> StaticBakeGetScrollingEntries();
 
 // ---------------------------------------------------------------------------
 // Texture scroll (sturdy-bassoon#187 A1)
@@ -222,11 +223,12 @@ double StaticBakeClockSeconds();
 // but the weight is read at record time, so a change needs no rebake. A host sets them from its
 // settings, and code can change them at any time (a scripted gust; the weather).
 //
-// THE BEND DIRECTION is the vertex's: along the frame's wind direction (direction code 0, wheat and
-// trees), or along a fixed horizontal line of the list's own space (codes 1-127, the cloth's own
-// normal for a flag or banner). In a map's list every placement is pre-transformed, so that line is
-// written per vertex, turned with its placement. Either way the bend moves `amplitude` world units at
-// weight 1.
+// THE BEND LINE is the vertex's (the owner's choice, sturdy-bassoon ADR 2026-10-07-animated-rs-props,
+// decisions 19-22): along the frame's wind direction (line 0, wheat and trees), or along a fixed
+// horizontal line of the list's own space (lines 1-127, the cloth's own normal for a flag or banner).
+// In a map's list every placement is pre-transformed, so that line is written per vertex, turned with
+// its placement. Either way the bend moves `amplitude` world units at weight 1 - under a list matrix
+// that only turns, moves and scales evenly, as a map list's identity and an actor's matrix do.
 //
 // NOT GATED: like the scroll, wind does not wait for StaticBakeSetEnabled(true). With the bake off, or
 // on a backend that cannot bake, the interpreter bends the same vertices by the same formula, so a
@@ -235,21 +237,23 @@ double StaticBakeClockSeconds();
 
 // Vtx_t.flag, as an archive's XML `Flag` attribute writes it:
 //   bit 15      STATIC_BAKE_WIND_FLAG_MARK: the vertex carries wind
-//   bits 8-14   the bend direction: 0 = along the wind; d = 1-127 = the horizontal line at angle
+//   bits 8-14   the bend line: 0 = along the wind; d = 1-127 = the horizontal line at angle
 //               (d - 1) x 180 / 127 degrees from the list's +z towards +x (OoT's yaw: x = sin, z = cos).
 //               A line, not an arrow: a bend is a sine, so the opposite direction is the same sway
 //               half a period apart.
 //   bits 0-7    the weight q, 1-255 (w = q / 255): 0 at what holds the vertex still, 255 at the hem
 // A flag without the marker, or with q = 0, is no wind at all.
 constexpr uint16_t STATIC_BAKE_WIND_FLAG_MARK = 0x8000;
-constexpr int STATIC_BAKE_WIND_FLAG_DIR_SHIFT = 8;
+constexpr int STATIC_BAKE_WIND_FLAG_LINE_SHIFT = 8;
 constexpr uint16_t STATIC_BAKE_WIND_FLAG_WEIGHT_MASK = 0x00FF;
-constexpr int STATIC_BAKE_WIND_DIRECTIONS = 127; // codes 1-127 split 180 degrees
+constexpr int STATIC_BAKE_WIND_LINES = 127; // lines 1-127 split 180 degrees
 
-// The code a flag carries into a recording: q + 256 x direction, 1-32767; 0 when it carries no wind.
+// The code a flag carries into a recording, the flag without its marker: q + 256 x line, 1-32767; 0 when
+// it carries no wind. Its weight is code & STATIC_BAKE_WIND_FLAG_WEIGHT_MASK, its line
+// code >> STATIC_BAKE_WIND_FLAG_LINE_SHIFT.
 constexpr uint16_t StaticBakeWindCode(uint16_t flag) {
     return ((flag & STATIC_BAKE_WIND_FLAG_MARK) != 0 && (flag & STATIC_BAKE_WIND_FLAG_WEIGHT_MASK) != 0)
-               ? (uint16_t)(flag & 0x7FFF)
+               ? (uint16_t)(flag & ~STATIC_BAKE_WIND_FLAG_MARK)
                : (uint16_t)0;
 }
 
@@ -262,6 +266,11 @@ struct StaticBakeWind {
     float wavelength = 400.0f; // world units; 0 = every placement in step
     float yawDeg = 0.0f;       // where it blows to, as OoT's yaw (degrees): x = sin, z = cos
     float ripple = 1.5f;       // radians of phase the hem (weight 1) lags behind weight 0
+
+    bool operator==(const StaticBakeWind& o) const {
+        return amplitude == o.amplitude && frequency == o.frequency && wavelength == o.wavelength &&
+               yawDeg == o.yawDeg && ripple == o.ripple;
+    }
 };
 // Set the frame's wind, from the next vertex drawn. Refused (false, nothing changed) when a value is
 // not finite, or the amplitude or wavelength is negative. Safe at any time on the game thread: a host's
@@ -269,8 +278,8 @@ struct StaticBakeWind {
 bool StaticBakeSetWind(const StaticBakeWind& wind);
 StaticBakeWind StaticBakeGetWind();
 
-// Every baked entry with at least one weighted vertex, keyed as registered (`staticbake props`).
-std::vector<StaticBakeScrollingEntry> StaticBakeGetWindEntries();
+// Every baked entry that recorded a weighted vertex (windTris != 0: the same test the replay makes).
+std::vector<StaticBakeKeyedEntry> StaticBakeGetWindEntries();
 
 // What the wind did in the last whole frame drawn, for a host's report and for checks:
 //   replayEntries   baked list entries replayed with wind vectors (a list holding weighted vertices
@@ -378,9 +387,9 @@ extern uint32_t gStaticBakeWindGeneration;
 // All zero while the amplitude is 0, or under a matrix that cannot be inverted. `fromInterpreter`
 // counts it in StaticBakeWindStats::interpVectors.
 void StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4], bool fromInterpreter);
-// The unit bend direction of a vertex's direction code (1-127), as the replay shader computes it:
-// (sin a, 0, cos a) with a = (code - 1) x pi / 127.
-void StaticBakeWindDirection(uint32_t directionCode, float out[3]);
+// The unit bend direction of a vertex's line (1-127), as the replay shader computes it:
+// (sin a, 0, cos a) with a = (line - 1) x pi / 127.
+void StaticBakeWindLine(uint32_t line, float out[3]);
 // From GfxSpVertex: in a record pass, `n` weighted vertices were loaded into the list being recorded;
 // otherwise, `n` weighted vertices were bent on the CPU.
 void StaticBakeNoteWindVertices(uint32_t n);

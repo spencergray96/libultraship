@@ -1130,10 +1130,10 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
 
     // The bend (wind in the replay, #209 W1): a vertex whose recorded w carries a wind code moves by a
     // sine of time and its position, before the camera - GfxSpVertex's formula on the same unbent
-    // position. The code is q + 256 x direction (StaticBakeWindCode): weight q / 255; direction 0 bends
-    // along the wind (uWindB), 1-127 along that horizontal line of the list's own space at the same
-    // length. A vertex recorded without wind has code 0 and is not touched.
-    static_assert(STATIC_BAKE_WIND_DIRECTIONS == 127, "the bend below splits 180 degrees into 127 lines");
+    // position. The code is q + 256 x line (StaticBakeWindCode): weight q / 255; line 0 bends along the
+    // wind (uWindB), 1-127 along that horizontal line of the list's own space at the same length. A
+    // vertex recorded without wind has code 0 and is not touched.
+    static_assert(STATIC_BAKE_WIND_LINES == 127, "the bend below splits 180 degrees into 127 lines");
     std::string posCode = "float3 bakePos = position.xyz;\n"
                           "    float bakeCode = floor(position.w * 0.25);\n"
                           "    if (bakeCode > 0.0) {\n"

@@ -59,7 +59,8 @@ ResourceFactoryXMLVertexV0::ReadResource(std::shared_ptr<Ship::File> file,
             data.v.ob[2] = child->IntAttribute("Z");
             // An archive vertex may carry wind (sturdy-bassoon#209 W1): its Flag attribute, kept only in
             // the marker's form (fast/StaticMeshCache.h, STATIC_BAKE_WIND_FLAG_*). Any other value loads
-            // as 0, as every flag did before, so an archive from another tool cannot bend by accident.
+            // as 0, as every flag did before: an archive from another tool bends only if it writes the
+            // marker itself.
             const unsigned int flag = child->UnsignedAttribute("Flag", 0);
             data.v.flag = flag <= 0xFFFF && StaticBakeWindCode((uint16_t)flag) != 0 ? (uint16_t)flag : 0;
             data.v.tc[0] = child->IntAttribute("S");

@@ -1754,18 +1754,36 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
+#ifdef ENABLE_STATIC_BAKE
+// Wind in the replay (sturdy-bassoon#209 W1): the bend of one weighted vertex's object-space position,
+// the replay shader's formula (StaticBakePatchSource) from the same vectors.
+static void BendForWind(float ob[3], uint16_t code, const float k[4], const float b[4], float lineScale) {
+    const uint32_t line = code >> STATIC_BAKE_WIND_FLAG_LINE_SHIFT;
+    const float wt = (float)(code & STATIC_BAKE_WIND_FLAG_WEIGHT_MASK) * (1.0f / 255.0f);
+    float bend[3] = { b[0], b[1], b[2] };
+    if (line != 0) {
+        StaticBakeWindLine(line, bend);
+        for (int c = 0; c < 3; c++) {
+            bend[c] *= lineScale;
+        }
+    }
+    const float s = wt * sinf(k[0] * ob[0] + k[1] * ob[1] + k[2] * ob[2] + k[3] + b[3] * wt);
+    for (int c = 0; c < 3; c++) {
+        ob[c] += bend[c] * s;
+    }
+}
+#endif
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices, bool archiveFlags) {
 #ifdef ENABLE_STATIC_BAKE
     // Wind in the replay (sturdy-bassoon#209 W1). Only an archive's vertices are decoded (the guard:
     // fast/StaticMeshCache.h). A record pass notes each weighted vertex's code and keeps its position
-    // raw, for the replay shader to bend; anything drawn here bends now, by the shader's formula, from
-    // the vectors for this modelview - worked out on the first weighted vertex and kept until the
-    // modelview, the frame or the wind changes, not on every vertex load.
+    // raw, for the replay shader to bend; anything drawn here bends now, from the vectors for this
+    // modelview - worked out on the first weighted vertex and kept until the modelview, the frame or the
+    // wind changes, not on every vertex load.
     const bool windDecode = archiveFlags && (gStaticBakeRecording || gStaticBakeWindOn);
     const bool windBend = windDecode && !gStaticBakeRecording;
-    const float* windK = nullptr;
-    const float* windB = nullptr;
-    float windFaceScale = 0.0f;
+    bool windReady = false;
     uint32_t windVertices = 0;
 #endif
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
@@ -1787,33 +1805,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 if (!windBend) {
                     d->windCode = code;
                 } else {
-                    if (windK == nullptr) {
+                    if (!windReady) {
                         const float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-                        if (!mWindVectorsValid || mWindVectorsGeneration != gStaticBakeWindGeneration ||
-                            memcmp(mWindVectorsModelview, mv, sizeof(mWindVectorsModelview)) != 0) {
-                            StaticBakeWindVectors(mv, mWindK, mWindB, true);
-                            memcpy(mWindVectorsModelview, mv, sizeof(mWindVectorsModelview));
-                            mWindVectorsGeneration = gStaticBakeWindGeneration;
-                            mWindVectorsValid = true;
+                        if (!mWind.valid || mWind.generation != gStaticBakeWindGeneration ||
+                            memcmp(mWind.modelview, mv, sizeof(mWind.modelview)) != 0) {
+                            StaticBakeWindVectors(mv, mWind.k, mWind.b, true);
+                            memcpy(mWind.modelview, mv, sizeof(mWind.modelview));
+                            mWind.generation = gStaticBakeWindGeneration;
+                            mWind.lineScale =
+                                sqrtf(mWind.b[0] * mWind.b[0] + mWind.b[1] * mWind.b[1] + mWind.b[2] * mWind.b[2]);
+                            mWind.valid = true;
                         }
-                        windK = mWindK;
-                        windB = mWindB;
-                        windFaceScale = sqrtf(windB[0] * windB[0] + windB[1] * windB[1] + windB[2] * windB[2]);
+                        windReady = true;
                     }
-                    const uint32_t direction = code >> 8;
-                    const float wt = (float)(code & 0xFF) * (1.0f / 255.0f);
-                    float bend[3] = { windB[0], windB[1], windB[2] };
-                    if (direction != 0) {
-                        StaticBakeWindDirection(direction, bend);
-                        for (int c = 0; c < 3; c++) {
-                            bend[c] *= windFaceScale;
-                        }
-                    }
-                    const float s =
-                        wt * sinf(windK[0] * ob[0] + windK[1] * ob[1] + windK[2] * ob[2] + windK[3] + windB[3] * wt);
-                    for (int c = 0; c < 3; c++) {
-                        ob[c] += bend[c] * s;
-                    }
+                    BendForWind(ob, code, mWind.k, mWind.b, mWind.lineScale);
                 }
             }
         }

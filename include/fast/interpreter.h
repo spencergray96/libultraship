@@ -557,11 +557,14 @@ class Interpreter {
     size_t mBufVboNumTris{};
     // Wind in the replay (sturdy-bassoon#209 W1): the vectors GfxSpVertex last worked out
     // (StaticBakeWindVectors), and the modelview and wind generation they were for.
-    bool mWindVectorsValid = false;
-    uint32_t mWindVectorsGeneration = 0;
-    float mWindVectorsModelview[4][4]{};
-    float mWindK[4]{};
-    float mWindB[4]{};
+    struct WindVectors {
+        bool valid = false;
+        uint32_t generation = 0;
+        float modelview[4][4]{};
+        float k[4]{};
+        float b[4]{};
+        float lineScale = 0.0f; // |b.xyz|: the length a vertex with its own line bends by
+    } mWind;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
     std::shared_ptr<GfxDebugger> mGfxDebugger;
