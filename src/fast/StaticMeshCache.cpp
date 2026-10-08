@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,30 @@ bool Scrolls(const BakedDraw& d) {
     return d.scroll[0] != 0.0f || d.scroll[1] != 0.0f;
 }
 
+// THROWAWAY plant (sturdy-bassoon#187 A1, never merged): SOH_A1_PLANT in the environment.
+//   split    the rate leaves the batch-closing condition (and so is tracked only when a cull or shade
+//            change closes a batch) and leaves the draw state: the split forced off, as written.
+//   noflush  the rate is still tracked on every material, but never closes a batch and leaves the
+//            draw state: the explicit flush alone forced off.
+int PlantMode() {
+    static const int mode = [] {
+        const char* e = getenv("SOH_A1_PLANT");
+        if (e == nullptr) {
+            return 0;
+        }
+        if (strcmp(e, "split") == 0) {
+            SPDLOG_WARN("[staticbake] THROWAWAY plant: the recorder's rate split is forced off (split)");
+            return 1;
+        }
+        if (strcmp(e, "noflush") == 0) {
+            SPDLOG_WARN("[staticbake] THROWAWAY plant: the recorder's rate flush is forced off (noflush)");
+            return 2;
+        }
+        return 0;
+    }();
+    return mode;
+}
+
 // Everything that has to match for a new capture to extend the previous draw instead of opening
 // one. Textures compare by hold handle, which is equal exactly when the view and the sampler are
 // the same objects - so two batches with one program but different textures, or one texture under
@@ -65,7 +90,7 @@ bool SameDrawState(const BakedDraw& a, const BakedDraw& b) {
            a.gpu.zmodeDecal == b.gpu.zmodeDecal && a.gpu.textures[0] == b.gpu.textures[0] &&
            a.gpu.textures[1] == b.gpu.textures[1] && a.numFloats == b.numFloats &&
            a.depthTestAndMask == b.depthTestAndMask && a.alphaBlend == b.alphaBlend && a.primDepth == b.primDepth &&
-           memcmp(a.scroll, b.scroll, sizeof(a.scroll)) == 0;
+           (PlantMode() != 0 || memcmp(a.scroll, b.scroll, sizeof(a.scroll)) == 0);
 }
 
 struct Entry {
@@ -1037,7 +1062,10 @@ void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& m) {
             ScrollRateOf(node->first.texture_addr, &scroll[2 * i]);
         }
     }
-    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask || memcmp(scroll, sRecordScroll, sizeof(scroll)) != 0) {
+    const bool rateChanged = PlantMode() == 1 ? false : memcmp(scroll, sRecordScroll, sizeof(scroll)) != 0;
+    if (PlantMode() == 2 && cull == sRecordCull && m.shadeMask == sRecordShadeMask) {
+        memcpy(sRecordScroll, scroll, sizeof(scroll)); // tracked, never flushed
+    } else if (cull != sRecordCull || m.shadeMask != sRecordShadeMask || rateChanged) {
         gfx->Flush(); // captures what is buffered under the *previous* mode, mask and rates
         sRecordCull = cull;
         sRecordShadeMask = m.shadeMask;
