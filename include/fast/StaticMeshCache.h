@@ -123,6 +123,46 @@ void StaticBakeNoteTexturePath(const char* path, const void* imageData);
 // Record passes and their total wall time since the last call, for the host's report.
 void StaticBakeTakeRecordTime(uint32_t* passes, double* ms);
 
+// THROWAWAY (sturdy-bassoon#208): wind in the replay. A vertex whose F3DVtx_t.flag is
+// STATIC_BAKE_WIND_MARK | q (q 1..255) bends by weight w = q/255:
+//   p' = p + bend * w * sin(2 pi f t - K . world(p) + ripple * w)
+// where K is the wind direction times 2 pi / wavelength. The bend is along the wind (axisMode 0, for
+// trees and wheat) or along a fixed axis of the display list's own space (axisMode 1, for a flag
+// whose cloth faces one way in its kind). amplitude is in world units. A recording keeps the raw
+// position and carries q in position.w; the replay bends in its vertex stage, and the interpreter
+// bends the same way in GfxSpVertex. Nothing is read at record time but q, so no rebake is needed
+// when these change. amplitude 0 turns it off.
+constexpr uint16_t STATIC_BAKE_WIND_MARK = 0x5700;
+struct StaticBakeWindParams {
+    float amplitude = 0.0f;  // world units at weight 1
+    float frequency = 1.0f;  // Hz
+    float wavelength = 0.0f; // world units; 0 = every vertex in phase
+    float yawDeg = 0.0f;     // world wind direction: x = sin(yaw), z = cos(yaw), as OoT's yaw
+    float ripple = 0.0f;     // radians of phase lag from weight 0 to weight 1 (a wave down the cloth)
+    int axisMode = 0;        // 0 = bend along the wind; 1 = along localAxis
+    float localAxis[3] = { 0.0f, 0.0f, 1.0f };
+};
+void StaticBakeSetWind(const StaticBakeWindParams& p);
+StaticBakeWindParams StaticBakeGetWind();
+// The per-draw wind vectors for a display list drawn under modelview mv (row-vector convention:
+// world = p * mv). k.xyz: the wave vector in the list's own space, k.w: the phase now (mod 2 pi);
+// b.xyz: the bend at weight 1 in the list's own space, b.w: ripple. False (and zeros) when wind is off.
+bool StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4]);
+// The bake's clock, in seconds: the pinned time (StaticBakeSetScrollClock), or the running one.
+double StaticBakeClockSeconds();
+
+// THROWAWAY (sturdy-bassoon#208): a flipbook picked at render time. `head` is a display-list pointer
+// unique to one copy (it is never walked); a G_DL to it is redirected to poses[k], with
+// k = floor(clock * posesPerSecond + phase) mod n, on every rendered frame - including the frames
+// frame interpolation makes between game ticks, which a pose chosen in an actor's Draw cannot reach.
+// The poses are ordinary lists: bake-registered ones replay, others are interpreted.
+void StaticBakeRegisterFlip(const void* head, const void* const* poses, int n, float posesPerSecond, float phase);
+void StaticBakeUnregisterFlip(const void* head);
+// The pose a G_DL to displayList draws now: itself unless it is a registered flip head.
+const void* StaticBakeResolveFlip(const void* displayList);
+// Pose changes the resolver has handed out since the last call (counted per head), for rate checks.
+uint32_t StaticBakeTakeFlipSwitches();
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------

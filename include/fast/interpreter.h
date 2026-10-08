@@ -232,6 +232,8 @@ struct LoadedVertex {
     // shader can light the vertex under whatever lights are current.
     bool lit;
     int8_t normal[3];
+    // THROWAWAY sturdy-bassoon#208: the wind weight a recording carries in position.w (0 = none).
+    uint8_t windQ;
 };
 
 struct RawTexMetadata {

@@ -1056,6 +1056,8 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           maxLights +
           "];\n"
           "    float4 uUvOffset;\n" // THROWAWAY sturdy-bassoon#187: TEXEL0's scroll offset
+          "    float4 uWindK;\n"    // THROWAWAY sturdy-bassoon#208: wave vector (xyz), phase now (w)
+          "    float4 uWindB;\n"    // THROWAWAY sturdy-bassoon#208: bend at weight 1 (xyz), ripple (w)
           "};\n\n";
 
     if (shadeMask != 0) {
@@ -1094,7 +1096,9 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         if (end == std::string::npos) {
             return false;
         }
-        src.insert(end + 1, "\n    if (position.w > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
+        // THROWAWAY sturdy-bassoon#208: w also carries 4 x the wind weight, so the lit flag is w mod 4.
+        src.insert(end + 1,
+                   "\n    if (fmod(position.w, 4.0) > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
     }
 
     // THROWAWAY sturdy-bassoon#187: TEXEL0 scrolls by the draw's offset (0 for a still texture).
@@ -1106,7 +1110,16 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         }
     }
 
-    std::string posCode = "float4 bakeClip = mul(float4(position.xyz, 1.0), uMVP);\n"
+    // THROWAWAY sturdy-bassoon#208: wind. A recorded w of (1 or 2) + 4q carries the weight q/255; the
+    // bend is GfxSpVertex's, in the list's own space, before the camera.
+    std::string posCode = "float3 bakePos = position.xyz;\n"
+                          "    float bakeQ = floor(position.w * 0.25);\n"
+                          "    if (bakeQ > 0.0) {\n"
+                          "        float bakeWt = bakeQ / 255.0;\n"
+                          "        bakePos += uWindB.xyz * (bakeWt * sin(dot(uWindK.xyz, position.xyz) + uWindK.w + "
+                          "uWindB.w * bakeWt));\n"
+                          "    }\n"
+                          "    float4 bakeClip = mul(float4(bakePos, 1.0), uMVP);\n"
                           "    result.position = float4(bakeClip.x, bakeClip.y, "
                           "(bakeClip.z + bakeClip.w) * 0.5, bakeClip.w);";
     const size_t posAt2 = src.find(kPosMarker);

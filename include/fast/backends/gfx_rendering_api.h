@@ -61,6 +61,10 @@ struct StaticBakeUniforms {
     float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
     // THROWAWAY sturdy-bassoon#187: this draw's TEXEL0 scroll offset, in texture widths (xy).
     float uvOffset[4];
+    // THROWAWAY sturdy-bassoon#208: wind, in the list's own space (StaticBakeWindVectors). windK.xyz
+    // the wave vector, windK.w the phase now; windB.xyz the bend at weight 1, windB.w the ripple.
+    float windK[4];
+    float windB[4];
 };
 
 // Texture slots a baked draw can bind: TEXEL0 and TEXEL1. The HD mask and blend slots behind them

@@ -1755,6 +1755,14 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+#ifdef ENABLE_STATIC_BAKE
+    // THROWAWAY sturdy-bassoon#208: wind. A recording keeps the raw position and notes the weight,
+    // which the replay bends by; anything drawn here bends now, by the same formula.
+    float windK[4], windB[4];
+    const bool windOn =
+        !gStaticBakeRecording && mRsp->modelview_matrix_stack_size > 0 &&
+        StaticBakeWindVectors(mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], windK, windB);
+#endif
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1764,21 +1772,38 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             return;
         }
 
-        float x = v->ob[0] * mRsp->MP_matrix[0][0] + v->ob[1] * mRsp->MP_matrix[1][0] +
-                  v->ob[2] * mRsp->MP_matrix[2][0] + mRsp->MP_matrix[3][0];
-        float y = v->ob[0] * mRsp->MP_matrix[0][1] + v->ob[1] * mRsp->MP_matrix[1][1] +
-                  v->ob[2] * mRsp->MP_matrix[2][1] + mRsp->MP_matrix[3][1];
-        float z = v->ob[0] * mRsp->MP_matrix[0][2] + v->ob[1] * mRsp->MP_matrix[1][2] +
-                  v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
-        float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
-                  v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+        float ob[3] = { (float)v->ob[0], (float)v->ob[1], (float)v->ob[2] };
+#ifdef ENABLE_STATIC_BAKE
+        d->windQ = 0;
+        if ((v->flag & 0xFF00) == STATIC_BAKE_WIND_MARK && (v->flag & 0xFF) != 0) {
+            if (gStaticBakeRecording) {
+                d->windQ = (uint8_t)(v->flag & 0xFF);
+            } else if (windOn) {
+                const float wt = (float)(v->flag & 0xFF) / 255.0f;
+                const float s =
+                    wt * sinf(windK[0] * ob[0] + windK[1] * ob[1] + windK[2] * ob[2] + windK[3] + windB[3] * wt);
+                ob[0] += windB[0] * s;
+                ob[1] += windB[1] * s;
+                ob[2] += windB[2] * s;
+            }
+        }
+#endif
+
+        float x = ob[0] * mRsp->MP_matrix[0][0] + ob[1] * mRsp->MP_matrix[1][0] + ob[2] * mRsp->MP_matrix[2][0] +
+                  mRsp->MP_matrix[3][0];
+        float y = ob[0] * mRsp->MP_matrix[0][1] + ob[1] * mRsp->MP_matrix[1][1] + ob[2] * mRsp->MP_matrix[2][1] +
+                  mRsp->MP_matrix[3][1];
+        float z = ob[0] * mRsp->MP_matrix[0][2] + ob[1] * mRsp->MP_matrix[1][2] + ob[2] * mRsp->MP_matrix[2][2] +
+                  mRsp->MP_matrix[3][2];
+        float w = ob[0] * mRsp->MP_matrix[0][3] + ob[1] * mRsp->MP_matrix[1][3] + ob[2] * mRsp->MP_matrix[2][3] +
+                  mRsp->MP_matrix[3][3];
 
         float world_pos[3] = { 0.0 };
         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
             float(*mtx)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-            world_pos[0] = v->ob[0] * mtx[0][0] + v->ob[1] * mtx[1][0] + v->ob[2] * mtx[2][0] + mtx[3][0];
-            world_pos[1] = v->ob[0] * mtx[0][1] + v->ob[1] * mtx[1][1] + v->ob[2] * mtx[2][1] + mtx[3][1];
-            world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
+            world_pos[0] = ob[0] * mtx[0][0] + ob[1] * mtx[1][0] + ob[2] * mtx[2][0] + mtx[3][0];
+            world_pos[1] = ob[0] * mtx[0][1] + ob[1] * mtx[1][1] + ob[2] * mtx[2][1] + mtx[3][1];
+            world_pos[2] = ob[0] * mtx[0][2] + ob[1] * mtx[1][2] + ob[2] * mtx[2][2] + mtx[3][2];
         }
 
         x = AdjXForAspectRatio(x);
@@ -2353,7 +2378,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mBufVbo[mBufVboLen++] = v_arr[i]->x;
         mBufVbo[mBufVboLen++] = (clip_parameters.invertY && !bakeRecording) ? -v_arr[i]->y : v_arr[i]->y;
         mBufVbo[mBufVboLen++] = z;
-        mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
+        float wOut = bakeLit ? STATIC_BAKE_LIT_W : w;
+#ifdef ENABLE_STATIC_BAKE
+        // THROWAWAY sturdy-bassoon#208: a recording carries the wind weight as 4q on top of w = 1 or 2.
+        if (bakeRecording && !is_rect) {
+            wOut += 4.0f * (float)v_arr[i]->windQ;
+        }
+#endif
+        mBufVbo[mBufVboLen++] = wOut;
 
         for (int t = 0; t < 2; t++) {
             if (!usedTextures[t]) {
@@ -4005,6 +4037,10 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+#ifdef ENABLE_STATIC_BAKE
+    // THROWAWAY sturdy-bassoon#208: a flip head becomes the pose its clock picks, every rendered frame.
+    subGFX = (F3DGfx*)StaticBakeResolveFlip(subGFX);
+#endif
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {

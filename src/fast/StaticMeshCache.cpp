@@ -309,6 +309,12 @@ void Replay(Interpreter* gfx, Entry& e) {
         }
     }
 
+    // THROWAWAY sturdy-bassoon#208: wind under this list's modelview (zeros when it is off).
+    if (gfx->mRsp->modelview_matrix_stack_size > 0) {
+        StaticBakeWindVectors(gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1], u.windK,
+                              u.windB);
+    }
+
     for (const BakedDraw& d : e.draws) {
         const bool depthTest = (d.depthTestAndMask & 1) != 0;
         const bool depthMask = (d.depthTestAndMask & 2) != 0;
@@ -695,10 +701,13 @@ bool StaticBakeScrollRate(const void* texAddr, float rate[2]) {
     return true;
 }
 
+double StaticBakeClockSeconds() {
+    return sScrollPinned >= 0.0f ? (double)sScrollPinned
+                                 : std::chrono::duration<double>(std::chrono::steady_clock::now() - sScrollEpoch).count();
+}
+
 void StaticBakeScrollOffset(const float rate[2], float out[2]) {
-    const double t = sScrollPinned >= 0.0f
-                         ? (double)sScrollPinned
-                         : std::chrono::duration<double>(std::chrono::steady_clock::now() - sScrollEpoch).count();
+    const double t = StaticBakeClockSeconds();
     for (int i = 0; i < 2; i++) {
         const double x = (double)rate[i] * t;
         out[i] = (float)(x - std::floor(x));
@@ -724,6 +733,138 @@ void StaticBakeTakeRecordTime(uint32_t* passes, double* ms) {
     }
     sRecordPasses = 0;
     sRecordMs = 0.0;
+}
+
+// THROWAWAY sturdy-bassoon#208: wind in the replay.
+namespace {
+StaticBakeWindParams sWind;
+
+struct FlipHead {
+    std::vector<const void*> poses;
+    float posesPerSecond;
+    float phase;
+    int last;
+};
+std::unordered_map<const void*, FlipHead> sFlips;
+uint32_t sFlipSwitches = 0;
+} // namespace
+
+void StaticBakeSetWind(const StaticBakeWindParams& p) {
+    sWind = p;
+}
+
+StaticBakeWindParams StaticBakeGetWind() {
+    return sWind;
+}
+
+bool StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4]) {
+    for (int i = 0; i < 4; i++) {
+        k[i] = b[i] = 0.0f;
+    }
+    if (sWind.amplitude == 0.0f) {
+        return false;
+    }
+    constexpr double kTau = 6.283185307179586;
+    const double yaw = (double)sWind.yawDeg * kTau / 360.0;
+    const double dir[3] = { std::sin(yaw), 0.0, std::cos(yaw) };
+    const double waveNumber = sWind.wavelength > 0.0f ? kTau / (double)sWind.wavelength : 0.0;
+    // world = p * M + T (row vectors, as GfxSpVertex multiplies), so K . world = (M K) . p + K . T.
+    double kWorldT = 0.0;
+    for (int i = 0; i < 3; i++) {
+        double s = 0.0;
+        for (int j = 0; j < 3; j++) {
+            s += (double)mv[i][j] * dir[j] * waveNumber;
+        }
+        k[i] = (float)-s; // the wave travels along the wind: sin(w t - K . x)
+        kWorldT += dir[i] * waveNumber * (double)mv[3][i];
+    }
+    double phase = std::fmod(kTau * ((double)sWind.frequency * StaticBakeClockSeconds()), kTau) - kWorldT;
+    phase = std::fmod(phase, kTau);
+    k[3] = (float)phase;
+    b[3] = sWind.ripple;
+
+    if (sWind.axisMode == 1) {
+        // A fixed axis of the list's own space, scaled so it moves `amplitude` world units.
+        const float* a = sWind.localAxis;
+        double w[3] = { 0.0, 0.0, 0.0 };
+        for (int j = 0; j < 3; j++) {
+            for (int i = 0; i < 3; i++) {
+                w[j] += (double)a[i] * (double)mv[i][j];
+            }
+        }
+        const double len = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (len < 1e-9) {
+            return false;
+        }
+        for (int i = 0; i < 3; i++) {
+            b[i] = (float)((double)a[i] * (double)sWind.amplitude / len);
+        }
+        return true;
+    }
+    // Along the wind: the object-space vector whose image under M is amplitude * dir, b = (A dir) M^-1.
+    const double m00 = mv[0][0], m01 = mv[0][1], m02 = mv[0][2];
+    const double m10 = mv[1][0], m11 = mv[1][1], m12 = mv[1][2];
+    const double m20 = mv[2][0], m21 = mv[2][1], m22 = mv[2][2];
+    const double det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20) + m02 * (m10 * m21 - m11 * m20);
+    if (std::fabs(det) < 1e-12) {
+        return false;
+    }
+    const double inv[3][3] = {
+        { (m11 * m22 - m12 * m21) / det, (m02 * m21 - m01 * m22) / det, (m01 * m12 - m02 * m11) / det },
+        { (m12 * m20 - m10 * m22) / det, (m00 * m22 - m02 * m20) / det, (m02 * m10 - m00 * m12) / det },
+        { (m10 * m21 - m11 * m20) / det, (m01 * m20 - m00 * m21) / det, (m00 * m11 - m01 * m10) / det },
+    };
+    for (int j = 0; j < 3; j++) {
+        double s = 0.0;
+        for (int i = 0; i < 3; i++) {
+            s += (double)sWind.amplitude * dir[i] * inv[i][j];
+        }
+        b[j] = (float)s;
+    }
+    return true;
+}
+
+void StaticBakeRegisterFlip(const void* head, const void* const* poses, int n, float posesPerSecond, float phase) {
+    if (head == nullptr || poses == nullptr || n <= 0) {
+        return;
+    }
+    FlipHead& f = sFlips[head];
+    f.poses.assign(poses, poses + n);
+    f.posesPerSecond = posesPerSecond;
+    f.phase = phase;
+    f.last = -1;
+}
+
+void StaticBakeUnregisterFlip(const void* head) {
+    sFlips.erase(head);
+}
+
+const void* StaticBakeResolveFlip(const void* displayList) {
+    if (sFlips.empty()) {
+        return displayList;
+    }
+    auto it = sFlips.find(displayList);
+    if (it == sFlips.end()) {
+        return displayList;
+    }
+    FlipHead& f = it->second;
+    const int n = (int)f.poses.size();
+    const double x = StaticBakeClockSeconds() * (double)f.posesPerSecond + (double)f.phase;
+    int k = (int)std::fmod(std::floor(x), (double)n);
+    if (k < 0) {
+        k += n;
+    }
+    if (k != f.last) {
+        sFlipSwitches++;
+        f.last = k;
+    }
+    return f.poses[k];
+}
+
+uint32_t StaticBakeTakeFlipSwitches() {
+    const uint32_t s = sFlipSwitches;
+    sFlipSwitches = 0;
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1177,30 @@ void StaticBakeTakeRecordTime(uint32_t* passes, double* ms) {
     if (ms != nullptr) {
         *ms = 0.0;
     }
+}
+void StaticBakeSetWind(const StaticBakeWindParams&) {
+}
+StaticBakeWindParams StaticBakeGetWind() {
+    return {};
+}
+bool StaticBakeWindVectors(const float[4][4], float k[4], float b[4]) {
+    for (int i = 0; i < 4; i++) {
+        k[i] = b[i] = 0.0f;
+    }
+    return false;
+}
+double StaticBakeClockSeconds() {
+    return 0.0;
+}
+void StaticBakeRegisterFlip(const void*, const void* const*, int, float, float) {
+}
+void StaticBakeUnregisterFlip(const void*) {
+}
+const void* StaticBakeResolveFlip(const void* displayList) {
+    return displayList;
+}
+uint32_t StaticBakeTakeFlipSwitches() {
+    return 0;
 }
 
 } // namespace Fast
