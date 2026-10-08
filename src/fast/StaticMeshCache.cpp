@@ -50,7 +50,8 @@ struct BakedDraw {
     float scroll[4];
 };
 
-bool Scrolls(const BakedDraw& d) {
+// TEXEL0 has a rate: the one the replay applies, so the draw moves. (TEXEL1's splits, but is not applied.)
+bool ScrollsTexel0(const BakedDraw& d) {
     return d.scroll[0] != 0.0f || d.scroll[1] != 0.0f;
 }
 
@@ -372,7 +373,7 @@ void Replay(Interpreter* gfx, Entry& e) {
     StaticBakeAnimUniforms anim = {};
 
     for (const BakedDraw& d : e.draws) {
-        if (Scrolls(d)) {
+        if (ScrollsTexel0(d)) {
             ScrollOffsetNow(d.scroll, anim.uvOffset);
         } else {
             anim.uvOffset[0] = anim.uvOffset[1] = 0.0f;
@@ -585,7 +586,7 @@ void FinishRecording(Interpreter* gfx) {
     std::vector<uint32_t> held;
     for (BakedDraw& d : e->draws) {
         d.gpu.bufferId = e->buffer;
-        scrollingDraws += Scrolls(d) ? 1 : 0;
+        scrollingDraws += ScrollsTexel0(d) ? 1 : 0;
         bool textured = false;
         for (uint32_t handle : d.gpu.textures) {
             if (handle != 0) {
@@ -704,7 +705,7 @@ StaticBakeEntryInfo InfoOf(const Entry& e) {
             info.draws = (uint32_t)e.draws.size();
             info.tris = (uint32_t)e.totalTris;
             for (const BakedDraw& d : e.draws) {
-                if (Scrolls(d)) {
+                if (ScrollsTexel0(d)) {
                     info.scrollingDraws++;
                     info.scrollingTris += (uint32_t)d.gpu.numTris;
                 }
@@ -1027,8 +1028,12 @@ void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& m) {
     //
     // And the scroll rates (#187 A1): the replay gives a draw one offset, so a texture that scrolls at
     // another rate is another draw. Each slot's rate is its texture's registration, if the combiner
-    // reads it. In practice a texture change has already flushed (GfxSpTri1 flushes before it imports
-    // one), so this closes nothing new today; it is what keeps the stamp right if that order changes.
+    // reads it - the same test GfxSpTri1's interpreted mirror makes (comb->usedTextures[0]), and the
+    // shader patch's (the program samples TEXEL0), so the three agree on which draws move. In practice
+    // a texture change has already flushed (GfxSpTri1 flushes before it imports one), so the flush here
+    // closes nothing new today; what carries the split is that the rate is TRACKED here, and the flush
+    // is what keeps the stamp right if that order ever changes (#187 A1's run, "The batch split,
+    // planted").
     const uint8_t cull = m.cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : m.cullCode;
     float scroll[4] = {};
     for (int i = 0; i < STATIC_BAKE_TEXTURE_SLOTS; i++) {

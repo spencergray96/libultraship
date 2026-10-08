@@ -2404,6 +2404,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
+            // Two arms rather than one write with a 0 offset, so a still texture's coordinates are
+            // exactly what they were before scrolls existed (adding 0.0f would turn -0 into +0).
             if (t == 0 && scrollsTexel0) {
                 mBufVbo[mBufVboLen++] = u / tex_width[t] + scrollOffset[0];
                 mBufVbo[mBufVboLen++] = v / tex_height[t] + scrollOffset[1];

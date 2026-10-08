@@ -252,8 +252,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     StaticBakeUniforms mStaticBakeCbData = {};
     bool mStaticBakeCbValid = false;
     // The second one, StaticBakeAnimUniforms (sturdy-bassoon#187 A1), and what it holds. It changes
-    // per draw only between a scrolling draw and a still one, so it is re-sent about twice a frame
-    // where they alternate, and never in a frame with nothing scrolling.
+    // only at a scrolling draw and at the still draw after one, so it is re-sent about twice per
+    // scrolling draw in a frame, and never in a frame with nothing scrolling.
     Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeAnimCb;
     StaticBakeAnimUniforms mStaticBakeAnimCbData = {};
     bool mStaticBakeAnimCbValid = false;

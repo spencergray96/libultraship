@@ -105,8 +105,9 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 
 // One registered display list, for a host that reports on the lists it offered by name
 // (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
-// and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them recorded with a
-// scroll rate (#187 A1). `rejectReason` is a string literal naming why the recorder refused it,
+// and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them whose TEXEL0
+// was recorded with a scroll rate, the draws that move (#187 A1; a rate on TEXEL1 alone is stamped but
+// not applied, so not counted). `rejectReason` is a string literal naming why the recorder refused it,
 // nullptr unless Rejected.
 enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
 struct StaticBakeEntryInfo {
@@ -140,10 +141,18 @@ std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries();
 // texture-cache clear, and lasts until it is changed, removed or cleared. Nothing else ever drops it.
 //
 // How a path reaches the pixels: the path is bound to the image data it resolves to each time an
-// archive list's G_SETTIMG_OTR_FILEPATH names it, which is the address a texture-cache key names. The
-// registry holds that texture resource while bound, so its address can never be reused by another
-// texture under it; a path that later resolves to a new resource (the alt-assets toggle) is re-bound
-// to it. A path never drawn by an archive list never binds, and never scrolls.
+// archive list's G_SETTIMG_OTR_FILEPATH names it, which is the address a texture-cache key names when
+// the texture is loaded whole (G_LOADBLOCK, what every archive prop emits). The registry holds that
+// texture resource while bound, so its address can never be reused by another texture under it; a
+// path that later resolves to a new resource (the alt-assets toggle) is re-bound to it. A path never
+// drawn by an archive list never binds, and never scrolls; nor does a texture loaded from an offset
+// into its image (G_LOADTILE), whose key is another address - which the recorder refuses anyway, so
+// baked and interpreted still agree. One image is one path: two paths that resolved to the same image
+// data would share one binding.
+//
+// NOT GATED: unlike the rest of this section, a scroll does not wait for StaticBakeSetEnabled(true).
+// With the bake off - or on a backend that cannot bake - the interpreter still scrolls a registered
+// texture, which is what keeps a baked frame and an interpreted one the same picture.
 //
 // RECORD TIME: a baked draw carries the rate the registry gave its texture WHEN IT WAS RECORDED. So
 // register before the list first draws; a change to a path an existing bake already recorded shows

@@ -71,7 +71,8 @@ struct StaticBakeUniforms {
 // (sturdy-bassoon#187 A1, laid out by #208's record, section 7, so wind lands here as two filled
 // registers rather than a rework). Separate from StaticBakeUniforms because it changes at a different
 // rate: those are per list entry, the offset is per draw. Each buffer is re-sent only when its own
-// contents change, so a list with no scrolling draw uploads this once, all zeros, and never again.
+// contents change, so in a frame with no scrolling draw this one is not re-sent at all (it holds
+// zeros), and where scrolling and still draws alternate it is re-sent at each change between them.
 // Mirrored member for member by the HLSL cbuffer StaticBakeAnimCB in StaticBakePatchSource.
 struct StaticBakeAnimUniforms {
     // Per draw. xy: the offset added to TEXEL0's texture coordinate, frac(rate x clock), in texture
