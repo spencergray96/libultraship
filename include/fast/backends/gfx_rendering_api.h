@@ -39,6 +39,12 @@ constexpr int STATIC_BAKE_MAX_DIR_LIGHTS = 7;
 // rebuilds w from the camera, so the slot is free.
 constexpr float STATIC_BAKE_LIT_W = 2.0f;
 
+// Reserved for wind in the replay (sturdy-bassoon#209): a recorded w of (1 or STATIC_BAKE_LIT_W) +
+// STATIC_BAKE_WIND_W_SCALE * q carries a vertex's wind weight q (0-255), exact in a float, so the lit
+// flag is w mod this. Nothing records a q yet, so every w is still 1 or 2 and the replay shader's
+// bend never runs.
+constexpr float STATIC_BAKE_WIND_W_SCALE = 4.0f;
+
 // Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the
 // vertex payload by the CPU. See fast/StaticMeshCache.h. Laid out to be memcpy'd straight into a
 // 16-byte-aligned constant buffer: the HLSL cbuffer in StaticBakePatchSource mirrors it member for
@@ -60,6 +66,24 @@ struct StaticBakeUniforms {
     float lightDir[STATIC_BAKE_MAX_DIR_LIGHTS][4];
     float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
 };
+
+// What moves in a baked draw: the second constant buffer on the replay's vertex stage
+// (sturdy-bassoon#187 A1, laid out by #208's record, section 7, so wind lands here as two filled
+// registers rather than a rework). Separate from StaticBakeUniforms because it changes at a different
+// rate: those are per list entry, the offset is per draw. Each buffer is re-sent only when its own
+// contents change, so a list with no scrolling draw uploads this once, all zeros, and never again.
+// Mirrored member for member by the HLSL cbuffer StaticBakeAnimCB in StaticBakePatchSource.
+struct StaticBakeAnimUniforms {
+    // Per draw. xy: the offset added to TEXEL0's texture coordinate, frac(rate x clock), in texture
+    // widths and heights. zw: TEXEL1's, reserved for several textures a prop (#201); 0 until then.
+    float uvOffset[4];
+    // Per list entry, reserved for wind in the replay (#209); 0 until then, which bends nothing.
+    // windK: xyz the wave vector in the list's own space, w the phase now. windB: xyz the bend at
+    // weight 1 in the list's own space, w the ripple.
+    float windK[4];
+    float windB[4];
+};
+static_assert(sizeof(StaticBakeAnimUniforms) == 48, "StaticBakeAnimCB is three float4 registers");
 
 // Texture slots a baked draw can bind: TEXEL0 and TEXEL1. The HD mask and blend slots behind them
 // (SHADER_FIRST_MASK_TEXTURE on) are refused at record time, so a baked draw never needs them.
@@ -183,9 +207,10 @@ class GfxRenderingAPI {
     }
     // One replayed draw. The caller has already applied depth/decal/prim-depth state through the
     // normal setters; this binds the persistent buffer, the transform-enabled shader, the draw's
-    // held textures and the uniforms, draws, and leaves the backend's "currently bound" memo true
-    // (or invalidated) so the next interpreted draw rebinds whatever it needs.
-    virtual void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) {
+    // held textures and both uniform blocks, draws, and leaves the backend's "currently bound" memo
+    // true (or invalidated) so the next interpreted draw rebinds whatever it needs.
+    virtual void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms,
+                                     const StaticBakeAnimUniforms& anim) {
     }
 
     // ---- Mipmaps for the host's own textures (sturdy-bassoon#146, fast/TextureMips.h). ----

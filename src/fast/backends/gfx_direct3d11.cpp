@@ -1019,16 +1019,26 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //     fog changes need no rebake;
 //   * lights each colour input in shadeMask (the SHADE inputs) from the normal a lit vertex was
 //     recorded with, under the current lights - which is why light changes need no rebake either.
-//     Only a vertex flagged lit in position.w is lit; an unlit one keeps its recorded colour.
-static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask) {
+//     Only a vertex flagged lit in position.w is lit; an unlit one keeps its recorded colour;
+//   * adds the draw's scroll offset to TEXEL0's texture coordinate (sturdy-bassoon#187 A1), from the
+//     second buffer, StaticBakeAnimCB. A still draw's offset is 0;
+//   * bends a vertex that carries a wind weight in position.w, from the same buffer: reserved for
+//     wind in the replay (#209). No recording carries a weight yet, so the bend never runs.
+static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
+    static const char* kUv0Marker = "result.uv0 = uv0;";
 
     const size_t posAt = src.find(kPosMarker);
     if (posAt == std::string::npos) {
         return false;
     }
     if (hasFog && src.find(kFogMarker) == std::string::npos) {
+        return false;
+    }
+    // A program that samples TEXEL0 has to have its pass-through line, or a scrolling draw would
+    // replay still while the interpreter scrolls it.
+    if (samplesTexel0 && src.find(kUv0Marker) == std::string::npos) {
         return false;
     }
 
@@ -1054,6 +1064,14 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "];\n"
           "    float4 uLightColor[" +
           maxLights + "];\n};\n\n";
+    // StaticBakeAnimUniforms, member for member: three float4 registers.
+    cb += "cbuffer StaticBakeAnimCB : register(b";
+    cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT);
+    cb += ") {\n"
+          "    float4 uUvOffset;\n" // xy TEXEL0's scroll offset; zw TEXEL1's, reserved for #201
+          "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); reserved for #209
+          "    float4 uWindB;\n"    // bend at weight 1 (xyz), ripple (w); reserved for #209
+          "};\n\n";
 
     if (shadeMask != 0) {
         // GfxSpVertex's directional-light sum, in its own order and units: start from the ambient
@@ -1080,7 +1098,10 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     // Each SHADE input's pass-through line is `result.inputN = inputN;`, or
     // `result.inputN = float4(inputN, 1.0);` without alpha. Light it right after, from what it just
     // copied: for a lit vertex that is the normal in .rgb, with the vertex's own alpha untouched.
+    // Recorded w is 1 or 2 plus 4 x a wind weight (STATIC_BAKE_WIND_W_SCALE), so the lit flag is
+    // w mod 4. While no recording carries a weight this is exactly the old `w > 1.5`.
     static_assert(STATIC_BAKE_LIT_W == 2.0f, "the lit test below splits recorded w = 1 from w = 2");
+    static_assert(STATIC_BAKE_WIND_W_SCALE == 4.0f, "the lit test and the bend below read w in steps of 4");
     for (int j = 0; (shadeMask >> j) != 0; j++) {
         if ((shadeMask & (1 << j)) == 0) {
             continue;
@@ -1091,10 +1112,30 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         if (end == std::string::npos) {
             return false;
         }
-        src.insert(end + 1, "\n    if (position.w > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
+        src.insert(end + 1,
+                   "\n    if (fmod(position.w, 4.0) > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
     }
 
-    std::string posCode = "float4 bakeClip = mul(float4(position.xyz, 1.0), uMVP);\n"
+    // The scroll: the texture slides under triangles that never move. Added after the recorded,
+    // already tile-normalised coordinate, which is what the interpreter's mirror adds it to as well.
+    if (samplesTexel0) {
+        const size_t uvAt = src.find(kUv0Marker, vsAt + cb.size());
+        if (uvAt == std::string::npos) {
+            return false;
+        }
+        src.replace(uvAt, strlen(kUv0Marker), "result.uv0 = uv0 + uUvOffset.xy;");
+    }
+
+    // The bend (reserved for #209): a weight q > 0 moves the vertex along uWindB by a sine of time and
+    // its position, before the camera. q is 0 for every vertex recorded today.
+    std::string posCode = "float3 bakePos = position.xyz;\n"
+                          "    float bakeQ = floor(position.w * 0.25);\n"
+                          "    if (bakeQ > 0.0) {\n"
+                          "        float bakeWt = bakeQ / 255.0;\n"
+                          "        bakePos += uWindB.xyz * (bakeWt * sin(dot(uWindK.xyz, position.xyz) + uWindK.w + "
+                          "uWindB.w * bakeWt));\n"
+                          "    }\n"
+                          "    float4 bakeClip = mul(float4(bakePos, 1.0), uMVP);\n"
                           "    result.position = float4(bakeClip.x, bakeClip.y, "
                           "(bakeClip.z + bakeClip.w) * 0.5, bakeClip.w);";
     const size_t posAt2 = src.find(kPosMarker);
@@ -1145,7 +1186,7 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
                      shadeMask, cc_features.numInputs, base->shader_id0, base->shader_id1);
         return nullptr;
     }
-    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask)) {
+    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0])) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");
@@ -1339,7 +1380,47 @@ void GfxRenderingAPIDX11::BindStaticTextures(const StaticBakeDraw& draw, const s
     }
 }
 
-void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) {
+bool GfxRenderingAPIDX11::UploadStaticBakeCb(ComPtr<ID3D11Buffer>& cb, void* shadow, bool& valid, const void* data,
+                                             UINT size) {
+    if (!cb) {
+        D3D11_BUFFER_DESC desc;
+        ZeroMemory(&desc, sizeof(desc));
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.ByteWidth = size;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(mDevice->CreateBuffer(&desc, nullptr, cb.GetAddressOf()))) {
+            SPDLOG_ERROR("[staticbake] failed to create a {} byte vertex-stage constant buffer", size);
+            return false;
+        }
+        valid = false;
+    }
+
+    // Nothing else writes these buffers, so what one last received is what it holds.
+    if (!valid || memcmp(shadow, data, size) != 0) {
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(ms));
+        if (FAILED(mContext->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+            // Skipping the draw beats drawing with stale lights. Once is enough to say so: this
+            // runs per draw, every frame.
+            static bool sReported = false;
+            if (!sReported) {
+                SPDLOG_ERROR("[staticbake] could not map a vertex-stage constant buffer; baked draws are skipped");
+                sReported = true;
+            }
+            valid = false;
+            return false;
+        }
+        memcpy(ms.pData, data, size);
+        mContext->Unmap(cb.Get(), 0);
+        memcpy(shadow, data, size);
+        valid = true;
+    }
+    return true;
+}
+
+void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms,
+                                              const StaticBakeAnimUniforms& anim) {
     const uint32_t bufferId = draw.bufferId;
     if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || draw.numTris == 0) {
         return;
@@ -1355,41 +1436,15 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const 
     BindStaticTextures(draw, variant);
     ApplyPrimDepthCb();
 
-    if (!mStaticBakeCb) {
-        D3D11_BUFFER_DESC desc;
-        ZeroMemory(&desc, sizeof(desc));
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.ByteWidth = sizeof(StaticBakeUniforms);
-        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(mDevice->CreateBuffer(&desc, nullptr, mStaticBakeCb.GetAddressOf()))) {
-            SPDLOG_ERROR("[staticbake] failed to create the vertex-stage constant buffer");
-            return;
-        }
-        mStaticBakeCbValid = false;
+    if (!UploadStaticBakeCb(mStaticBakeCb, &mStaticBakeCbData, mStaticBakeCbValid, &uniforms,
+                            sizeof(StaticBakeUniforms)) ||
+        !UploadStaticBakeCb(mStaticBakeAnimCb, &mStaticBakeAnimCbData, mStaticBakeAnimCbValid, &anim,
+                            sizeof(StaticBakeAnimUniforms))) {
+        return;
     }
-
-    // Nothing else writes this buffer, so what it last received is what it holds.
-    if (!mStaticBakeCbValid || memcmp(&mStaticBakeCbData, &uniforms, sizeof(StaticBakeUniforms)) != 0) {
-        D3D11_MAPPED_SUBRESOURCE ms;
-        ZeroMemory(&ms, sizeof(ms));
-        if (FAILED(mContext->Map(mStaticBakeCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
-            // Skipping the draw beats drawing with stale lights. Once is enough to say so: this
-            // runs per draw, every frame.
-            static bool sReported = false;
-            if (!sReported) {
-                SPDLOG_ERROR("[staticbake] could not map the vertex-stage constant buffer; baked draws are skipped");
-                sReported = true;
-            }
-            mStaticBakeCbValid = false;
-            return;
-        }
-        memcpy(ms.pData, &uniforms, sizeof(StaticBakeUniforms));
-        mContext->Unmap(mStaticBakeCb.Get(), 0);
-        mStaticBakeCbData = uniforms;
-        mStaticBakeCbValid = true;
-    }
-    mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 1, mStaticBakeCb.GetAddressOf());
+    static_assert(STATIC_BAKE_ANIM_CB_SLOT == STATIC_BAKE_CB_SLOT + 1, "both buffers bind in one call");
+    ID3D11Buffer* const cbs[2] = { mStaticBakeCb.Get(), mStaticBakeAnimCb.Get() };
+    mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 2, cbs);
 
     const uint32_t stride = variant->numFloats * sizeof(float);
     const uint32_t offset = (uint32_t)draw.byteOffset;

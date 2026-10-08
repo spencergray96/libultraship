@@ -40,10 +40,21 @@
 // take this path), and any command or material feature the recorder does not understand aborts
 // that display list's bake *permanently* and falls back to interpretation. Safe by construction,
 // not by analysis.
+//
+// Scrolling textures (sturdy-bassoon#187 A1): a texture can slide across a baked surface without a
+// re-record, the way lighting changes without one. The recording stays as it is; the replay's vertex
+// stage adds frac(rate x clock) to TEXEL0's coordinate, and the interpreter adds the same offset to
+// the coordinates it writes, so a frame drawn without the bake (the bake off, a frame that falls back,
+// a backend that cannot bake) shows the same picture. See "Texture scroll" below.
+
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace Fast {
 
 class Interpreter;
+class Texture;
 struct StaticBakeUniforms;
 
 // ---------------------------------------------------------------------------
@@ -94,16 +105,80 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 
 // One registered display list, for a host that reports on the lists it offered by name
 // (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
-// and triangles, 0 unless Baked. `rejectReason` is a string literal naming why the recorder refused
-// it, nullptr unless Rejected.
+// and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them recorded with a
+// scroll rate (#187 A1). `rejectReason` is a string literal naming why the recorder refused it,
+// nullptr unless Rejected.
 enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
 struct StaticBakeEntryInfo {
     StaticBakeEntryState state = StaticBakeEntryState::NotRegistered;
     uint32_t draws = 0;
     uint32_t tris = 0;
+    uint32_t scrollingDraws = 0;
+    uint32_t scrollingTris = 0;
     const char* rejectReason = nullptr;
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
+
+// Every baked entry with at least one scrolling draw, keyed as registered, for a report that cannot
+// enumerate the lists itself (`staticbake props`, which joins these to its own lines by key).
+struct StaticBakeScrollingEntry {
+    const void* key = nullptr;
+    StaticBakeEntryInfo info;
+};
+std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries();
+
+// ---------------------------------------------------------------------------
+// Texture scroll (sturdy-bassoon#187 A1)
+//
+// A texture registered by archive path scrolls at (du, dv) texture widths and heights a second
+// wherever it is drawn as TEXEL0, baked or interpreted: RS's texture animation, which belongs to the
+// texture, not to the model that uses it. Texture rectangles never scroll.
+//
+// LIFETIME: the registry belongs to the process, not to a scene, a bake group or a recording. A
+// registration survives StaticBakeReset (a scene or bake-group change, `staticbake reset`),
+// StaticBakeInvalidateAll (`staticbake rebake`, the alt-assets toggle, a filter change) and every
+// texture-cache clear, and lasts until it is changed, removed or cleared. Nothing else ever drops it.
+//
+// How a path reaches the pixels: the path is bound to the image data it resolves to each time an
+// archive list's G_SETTIMG_OTR_FILEPATH names it, which is the address a texture-cache key names. The
+// registry holds that texture resource while bound, so its address can never be reused by another
+// texture under it; a path that later resolves to a new resource (the alt-assets toggle) is re-bound
+// to it. A path never drawn by an archive list never binds, and never scrolls.
+//
+// RECORD TIME: a baked draw carries the rate the registry gave its texture WHEN IT WAS RECORDED. So
+// register before the list first draws; a change to a path an existing bake already recorded shows
+// on baked draws only after StaticBakeInvalidateAll (`staticbake rebake`), while interpreted draws
+// follow at once. The recorder closes a batch where TEXEL0's rate changes, so a scrolling material is
+// a draw of its own; a list with no scrolling texture records exactly as before.
+// ---------------------------------------------------------------------------
+
+// Register, change or remove one texture's scroll: `path` as an archive list names it (with or without
+// "__OTR__"), (du, dv) in texture widths and heights a second; (0, 0) removes it. IDEMPOTENT: the same
+// rate again changes nothing and costs a lookup, so a host can call it every time it loads a list that
+// draws the texture (#187 A2 does, at list load, before the list's first draw). Returns true when the
+// registry changed: a rate added, changed or removed - the case where a bake recorded under the old
+// rate needs StaticBakeInvalidateAll. Rates must be finite; a non-finite rate is refused (false).
+bool StaticBakeSetTextureScroll(const char* path, float du, float dv);
+// Remove every registration (the console's `staticbake scroll clear`). Same record-time rule.
+void StaticBakeClearTextureScrolls();
+// The registrations, in no particular order. `bound`: the path has resolved to image data since it
+// was registered, so draws of it scroll.
+struct StaticBakeTextureScroll {
+    std::string path;
+    float du = 0.0f;
+    float dv = 0.0f;
+    bool bound = false;
+};
+std::vector<StaticBakeTextureScroll> StaticBakeGetTextureScrolls();
+
+// The clock every moving thing in the replay reads (the scroll; wind, #209): seconds since the process
+// started, sampled once at the start of each rendered frame so every draw of a frame - baked or
+// interpreted, interpolated frames included - sees one value. Pin it for same-picture comparisons:
+// StaticBakePinClock(t) holds it at t seconds (t >= 0) until StaticBakePinClock with t < 0 lets it
+// run again, from real time.
+void StaticBakePinClock(double seconds);
+bool StaticBakeClockIsPinned();
+double StaticBakeClockSeconds();
 
 // ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
@@ -161,5 +236,22 @@ void StaticBakeAbort(Interpreter* gfx, const char* reason);
 // Safety net: a display list that never returns would otherwise leave recording armed across
 // frames. Called once at the end of Interpreter::Run.
 void StaticBakeEndFrame(Interpreter* gfx);
+
+// Texture scroll, the interpreter's side (#187 A1).
+//
+// True while at least one registered path is bound to image data: the interpreter's per-triangle gate,
+// read on its hot path like gStaticBakeRecording, so a session that registers nothing pays one test of
+// a bool per triangle.
+extern bool gStaticBakeScrollsBound;
+// From the start of Interpreter::Run: samples the clock for this frame (StaticBakeClockSeconds).
+void StaticBakeBeginFrame();
+// From the G_SETTIMG_OTR_FILEPATH handler: `path` resolved to `imageData`, owned by `owner` (the
+// texture resource). Binds a registered path, holding `owner` so the address stays its own, and moves
+// the binding (letting the old resource go) when the path now resolves somewhere else. No-op for an
+// unregistered path, and while nothing is registered.
+void StaticBakeNoteTexture(const char* path, const void* imageData, const std::shared_ptr<Texture>& owner);
+// The offset to add now, in texture widths and heights, to the coordinates of a triangle whose TEXEL0
+// is the image data at `imageData`; false (and `out` untouched) when that texture does not scroll.
+bool StaticBakeTextureScrollOffset(const void* imageData, float out[2]);
 
 } // namespace Fast

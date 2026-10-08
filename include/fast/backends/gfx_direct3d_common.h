@@ -45,6 +45,9 @@ struct PerPrimDepthCB {
 // cbuffers on the same register in one translation unit even when different entry points use
 // them. Nothing but the baked vertex shader ever reads it.
 constexpr uint32_t STATIC_BAKE_CB_SLOT = 3;
+// The baked draws' second vertex-stage buffer, StaticBakeAnimUniforms (sturdy-bassoon#187 A1): the
+// next register, so one VSSetConstantBuffers call binds both.
+constexpr uint32_t STATIC_BAKE_ANIM_CB_SLOT = STATIC_BAKE_CB_SLOT + 1;
 
 struct Coord {
     int x, y;
@@ -159,7 +162,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     uint8_t GetShaderNumFloats(struct ShaderProgram* prg) override;
     uint32_t HoldStaticTexture(int slot) override;
     void ReleaseStaticTexture(uint32_t handle) override;
-    void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms) override;
+    void DrawStaticTriangles(const StaticBakeDraw& draw, const StaticBakeUniforms& uniforms,
+                             const StaticBakeAnimUniforms& anim) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -188,6 +192,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ApplyPrimDepthCb();
     // Bind a baked draw's held textures, samplers and three-point inputs for the twin's used slots.
     void BindStaticTextures(const StaticBakeDraw& draw, const struct ShaderProgramD3D11* variant);
+    // One of the baked draws' vertex-stage constant buffers: create it on first use, and re-send it
+    // only when `data` differs from `shadow`, what it last received. False when it could not be
+    // created or mapped, and the caller skips the draw rather than draw with stale constants.
+    bool UploadStaticBakeCb(Microsoft::WRL::ComPtr<ID3D11Buffer>& cb, void* shadow, bool& valid, const void* data,
+                            UINT size);
     // The transform-enabled twin of a program, compiled on first use, lighting the colour inputs
     // in shadeMask. Null if shadeMask names an input the program lacks, if the generated HLSL did
     // not carry the markers the patch needs (see StaticBakePatchSource), or if it did not compile.
@@ -242,6 +251,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // turns a map-and-upload per draw into one per room.
     StaticBakeUniforms mStaticBakeCbData = {};
     bool mStaticBakeCbValid = false;
+    // The second one, StaticBakeAnimUniforms (sturdy-bassoon#187 A1), and what it holds. It changes
+    // per draw only between a scrolling draw and a still one, so it is re-sent about twice a frame
+    // where they alternate, and never in a frame with nothing scrolling.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeAnimCb;
+    StaticBakeAnimUniforms mStaticBakeAnimCbData = {};
+    bool mStaticBakeAnimCbValid = false;
     // Rasterizer states for baked draws, indexed cullMode * 2 + zmodeDecal. Built on demand and
     // kept, because a baked draw binds one every frame.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mStaticRasterizers[6];

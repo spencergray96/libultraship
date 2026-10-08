@@ -2337,6 +2337,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         bake_material.shadeMask = bake_shade_mask;
         StaticBakeNoteMaterial(this, bake_material);
     }
+
+    // A scrolling TEXEL0 (sturdy-bassoon#187 A1), drawn interpreted: the same offset the replay's vertex
+    // stage adds, added to the same tile-normalised coordinate, so the picture is the same either way.
+    // A record pass keeps the raw coordinates (the replay adds it), and a texture rectangle never
+    // scrolls. The gate is one bool while nothing is bound.
+    float scrollOffset[2];
+    const bool scrollsTexel0 =
+        gStaticBakeScrollsBound && !bakeRecording && !is_rect && comb->usedTextures[0] && usedTextures[0] &&
+        mRenderingState.mTextures[0] != nullptr &&
+        StaticBakeTextureScrollOffset(mRenderingState.mTextures[0]->first.texture_addr, scrollOffset);
+#else
+    constexpr bool scrollsTexel0 = false;
+    const float scrollOffset[2] = { 0.0f, 0.0f };
 #endif
 
     for (int i = 0; i < 3; i++) {
@@ -2391,8 +2404,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            if (t == 0 && scrollsTexel0) {
+                mBufVbo[mBufVboLen++] = u / tex_width[t] + scrollOffset[0];
+                mBufVbo[mBufVboLen++] = v / tex_height[t] + scrollOffset[1];
+            } else {
+                mBufVbo[mBufVboLen++] = u / tex_width[t];
+                mBufVbo[mBufVboLen++] = v / tex_height[t];
+            }
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
@@ -4441,6 +4459,11 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         rawTexMetadata.type = texture->Type;
         rawTexMetadata.resource = texture;
         NoteMipScopeArchive(texture);
+#ifdef ENABLE_STATIC_BAKE
+        // Binds a registered scrolling texture's path to the image data a texture-cache key will name
+        // (sturdy-bassoon#187 A1); the registry holds the resource while bound.
+        StaticBakeNoteTexture(fileName, texture->ImageData, texture);
+#endif
 
         uint32_t fmt = C0(21, 3);
         uint32_t size = C0(19, 2);
@@ -5484,6 +5507,11 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     PerfCountersFrameScope perfFrame;
 
     SpReset();
+#ifdef ENABLE_STATIC_BAKE
+    // One clock value for the whole frame, so a scrolling texture is at one offset in every draw of
+    // it, baked or interpreted (sturdy-bassoon#187 A1).
+    StaticBakeBeginFrame();
+#endif
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

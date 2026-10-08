@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -15,6 +16,7 @@
 namespace Fast {
 
 bool gStaticBakeRecording = false;
+bool gStaticBakeScrollsBound = false;
 
 namespace {
 
@@ -34,23 +36,36 @@ enum class BakeState : uint8_t {
 // applied, the SHADE inputs the replay lights, the decal mode, and the draw's own held textures -
 // one reference per slot the program samples, released in ReleaseGpu. Its bufferId is filled in
 // once the room's buffer exists.
+//
+// `scroll` is the scroll rate the registry gave each slot's texture when the batch was recorded
+// (sturdy-bassoon#187 A1), in texture widths and heights a second: xy TEXEL0's, zw TEXEL1's. The
+// replay turns TEXEL0's into the draw's offset. TEXEL1's splits batches but is not applied: a baked
+// prop samples one texture today, and several textures a prop (#201) is what makes it move.
 struct BakedDraw {
     StaticBakeDraw gpu;
     uint8_t numFloats;
     uint8_t depthTestAndMask;
     bool alphaBlend;
     uint16_t primDepth;
+    float scroll[4];
 };
+
+bool Scrolls(const BakedDraw& d) {
+    return d.scroll[0] != 0.0f || d.scroll[1] != 0.0f;
+}
 
 // Everything that has to match for a new capture to extend the previous draw instead of opening
 // one. Textures compare by hold handle, which is equal exactly when the view and the sampler are
 // the same objects - so two batches with one program but different textures, or one texture under
-// different wrap or filter settings, stay separate draws.
+// different wrap or filter settings, stay separate draws. The scroll rates compare too: a draw has one
+// offset. (Today a rate belongs to a texture, so two batches with equal hold handles have equal rates
+// and the term never decides on its own; it keeps the draw's state complete if that ever changes.)
 bool SameDrawState(const BakedDraw& a, const BakedDraw& b) {
     return a.gpu.prg == b.gpu.prg && a.gpu.shadeMask == b.gpu.shadeMask && a.gpu.cullMode == b.gpu.cullMode &&
            a.gpu.zmodeDecal == b.gpu.zmodeDecal && a.gpu.textures[0] == b.gpu.textures[0] &&
            a.gpu.textures[1] == b.gpu.textures[1] && a.numFloats == b.numFloats &&
-           a.depthTestAndMask == b.depthTestAndMask && a.alphaBlend == b.alphaBlend && a.primDepth == b.primDepth;
+           a.depthTestAndMask == b.depthTestAndMask && a.alphaBlend == b.alphaBlend && a.primDepth == b.primDepth &&
+           memcmp(a.scroll, b.scroll, sizeof(a.scroll)) == 0;
 }
 
 struct Entry {
@@ -88,6 +103,68 @@ const char* sAbortReason = nullptr;
 // a fresh batch. (0xFF is never a real mask: a combiner has at most 7 inputs.)
 uint8_t sRecordCull = 0xFF;
 uint8_t sRecordShadeMask = 0xFF;
+// The scroll rates (BakedDraw::scroll) the buffered triangles were emitted under; closed the same way.
+float sRecordScroll[4] = {};
+
+// The texture scroll registry (sturdy-bassoon#187 A1), for the life of the process: see the header's
+// "Texture scroll". Keyed by the path as an archive list names it, without "__OTR__". A path is bound
+// when it resolves: `image` is the image data, which is what a texture-cache key names, and `owner`
+// the texture resource, held so that address stays this texture's for as long as it is bound.
+struct ScrollReg {
+    float rate[2] = {};
+    const void* image = nullptr;
+    std::shared_ptr<const void> owner;
+};
+std::unordered_map<std::string, ScrollReg> sScrollByPath;
+// The bound addresses and their rates: the lookup the recorder and the interpreter make per triangle.
+// Exactly one per bound path; gStaticBakeScrollsBound says whether it is empty.
+std::unordered_map<const void*, std::pair<float, float>> sScrollByImage;
+
+// The clock (StaticBakeClockSeconds): real time since the process started, or pinned.
+const std::chrono::steady_clock::time_point sClockEpoch = std::chrono::steady_clock::now();
+double sClockPinned = -1.0; // < 0: running
+double sClockNow = 0.0;     // this frame's value, sampled by StaticBakeBeginFrame
+
+double RealClockSeconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - sClockEpoch).count();
+}
+
+const char* StripOtr(const char* path) {
+    return strncmp(path, "__OTR__", 7) == 0 ? path + 7 : path;
+}
+
+void Unbind(ScrollReg& reg) {
+    if (reg.image != nullptr) {
+        sScrollByImage.erase(reg.image);
+    }
+    reg.image = nullptr;
+    reg.owner.reset();
+    gStaticBakeScrollsBound = !sScrollByImage.empty();
+}
+
+// The rate of the texture whose image data is at `image`, into out[0..1]; false (out untouched) when
+// it does not scroll.
+bool ScrollRateOf(const void* image, float* out) {
+    if (!gStaticBakeScrollsBound || image == nullptr) {
+        return false;
+    }
+    auto it = sScrollByImage.find(image);
+    if (it == sScrollByImage.end()) {
+        return false;
+    }
+    out[0] = it->second.first;
+    out[1] = it->second.second;
+    return true;
+}
+
+// frac(rate x clock) per axis: only the fraction, so the number stays small and exact however long the
+// session runs, and a wrapping texture shows the same picture either way.
+void ScrollOffsetNow(const float* rate, float* out) {
+    for (int i = 0; i < 2; i++) {
+        const double x = (double)rate[i] * sClockNow;
+        out[i] = (float)(x - std::floor(x));
+    }
+}
 
 // Opcodes the recorder understands. Anything else - a matrix load, a segment write, a branch_z -
 // means the display list is doing something the replay could not reproduce, so the bake is
@@ -216,6 +293,7 @@ void BeginRecording(Interpreter* gfx, const void* key, Entry& e) {
     sAbortReason = nullptr;
     sRecordCull = 0xFF;
     sRecordShadeMask = 0xFF;
+    memset(sRecordScroll, 0, sizeof(sRecordScroll));
     // g_exec_stack.call() pushes exactly one frame for the display list we are about to enter.
     sRecordDepth = g_exec_stack.cmd_stack.size() + 1;
     gStaticBakeRecording = true;
@@ -288,7 +366,17 @@ void Replay(Interpreter* gfx, Entry& e) {
         }
     }
 
+    // What moves (#187 A1): per list entry the wind registers, which stay 0 until wind in the replay
+    // (#209) fills them; per draw TEXEL0's scroll offset, 0 for a still draw. The backend re-sends the
+    // block only when it changes, so a list with nothing scrolling sends it at most once.
+    StaticBakeAnimUniforms anim = {};
+
     for (const BakedDraw& d : e.draws) {
+        if (Scrolls(d)) {
+            ScrollOffsetNow(d.scroll, anim.uvOffset);
+        } else {
+            anim.uvOffset[0] = anim.uvOffset[1] = 0.0f;
+        }
         const bool depthTest = (d.depthTestAndMask & 1) != 0;
         const bool depthMask = (d.depthTestAndMask & 2) != 0;
         if (d.depthTestAndMask != gfx->mRenderingState.depth_test_and_mask) {
@@ -304,7 +392,7 @@ void Replay(Interpreter* gfx, Entry& e) {
             gfx->mRenderingState.alpha_blend = d.alphaBlend;
         }
         gfx->mRapi->SetCurrentPrimDepth((float)d.primDepth / 32767.0f);
-        gfx->mRapi->DrawStaticTriangles(d.gpu, u);
+        gfx->mRapi->DrawStaticTriangles(d.gpu, u, anim);
 
         gPerfCounters.draws++;
         gPerfCounters.drawsBaked++;
@@ -493,9 +581,11 @@ void FinishRecording(Interpreter* gfx) {
     // The textured draws and the distinct textures they hold, for the log: a room that loads textures
     // and reports 0 here is not drawing them.
     size_t texturedDraws = 0;
+    size_t scrollingDraws = 0;
     std::vector<uint32_t> held;
     for (BakedDraw& d : e->draws) {
         d.gpu.bufferId = e->buffer;
+        scrollingDraws += Scrolls(d) ? 1 : 0;
         bool textured = false;
         for (uint32_t handle : d.gpu.textures) {
             if (handle != 0) {
@@ -510,12 +600,13 @@ void FinishRecording(Interpreter* gfx) {
 
     e->state = BakeState::Baked;
     // The draws the list would have in list order, and what ordering it by material cost, after the
-    // fields older run scripts parse.
+    // fields older run scripts parse; then the scrolling draws (#187 A1), after those.
     SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures; "
-                "{} draws in list order, {}",
+                "{} draws in list order, {}; {} scrolling draws",
                 key, e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws,
                 held.size(), listOrderDraws,
-                sSortByMaterial ? fmt::format("sorted by material in {:.2f} ms", sortMs) : std::string("not sorted"));
+                sSortByMaterial ? fmt::format("sorted by material in {:.2f} ms", sortMs) : std::string("not sorted"),
+                scrollingDraws);
     e->staging.clear();
     e->staging.shrink_to_fit();
 
@@ -600,13 +691,10 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
     }
 }
 
-StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
+namespace {
+
+StaticBakeEntryInfo InfoOf(const Entry& e) {
     StaticBakeEntryInfo info;
-    auto it = sEntries.find(displayList);
-    if (it == sEntries.end()) {
-        return info;
-    }
-    const Entry& e = it->second;
     switch (e.state) {
         case BakeState::Unbaked:
             info.state = StaticBakeEntryState::Unbaked;
@@ -615,6 +703,12 @@ StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
             info.state = StaticBakeEntryState::Baked;
             info.draws = (uint32_t)e.draws.size();
             info.tris = (uint32_t)e.totalTris;
+            for (const BakedDraw& d : e.draws) {
+                if (Scrolls(d)) {
+                    info.scrollingDraws++;
+                    info.scrollingTris += (uint32_t)d.gpu.numTris;
+                }
+            }
             break;
         case BakeState::Rejected:
             info.state = StaticBakeEntryState::Rejected;
@@ -622,6 +716,96 @@ StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
             break;
     }
     return info;
+}
+
+} // namespace
+
+StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList) {
+    auto it = sEntries.find(displayList);
+    if (it == sEntries.end()) {
+        return {};
+    }
+    return InfoOf(it->second);
+}
+
+std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries() {
+    std::vector<StaticBakeScrollingEntry> out;
+    for (const auto& kv : sEntries) {
+        StaticBakeEntryInfo info = InfoOf(kv.second);
+        if (info.scrollingDraws != 0) {
+            out.push_back({ kv.first, info });
+        }
+    }
+    return out;
+}
+
+bool StaticBakeSetTextureScroll(const char* path, float du, float dv) {
+    if (path == nullptr || *path == '\0' || !std::isfinite(du) || !std::isfinite(dv)) {
+        return false;
+    }
+    // -0 and +0 are one rate: a draw state compares rates bit for bit.
+    du = du == 0.0f ? 0.0f : du;
+    dv = dv == 0.0f ? 0.0f : dv;
+    const std::string key = StripOtr(path);
+    auto it = sScrollByPath.find(key);
+    if (du == 0.0f && dv == 0.0f) {
+        if (it == sScrollByPath.end()) {
+            return false;
+        }
+        Unbind(it->second);
+        sScrollByPath.erase(it);
+        return true;
+    }
+    if (it == sScrollByPath.end()) {
+        ScrollReg reg;
+        reg.rate[0] = du;
+        reg.rate[1] = dv;
+        sScrollByPath.emplace(key, std::move(reg)); // bound when an archive list next names it
+        return true;
+    }
+    ScrollReg& reg = it->second;
+    if (reg.rate[0] == du && reg.rate[1] == dv) {
+        return false; // the idempotent case: a host re-registering at every list load
+    }
+    reg.rate[0] = du;
+    reg.rate[1] = dv;
+    if (reg.image != nullptr) {
+        sScrollByImage[reg.image] = { du, dv };
+    }
+    return true;
+}
+
+void StaticBakeClearTextureScrolls() {
+    sScrollByPath.clear(); // releases every held texture resource
+    sScrollByImage.clear();
+    gStaticBakeScrollsBound = false;
+}
+
+std::vector<StaticBakeTextureScroll> StaticBakeGetTextureScrolls() {
+    std::vector<StaticBakeTextureScroll> out;
+    out.reserve(sScrollByPath.size());
+    for (const auto& kv : sScrollByPath) {
+        StaticBakeTextureScroll s;
+        s.path = kv.first;
+        s.du = kv.second.rate[0];
+        s.dv = kv.second.rate[1];
+        s.bound = kv.second.image != nullptr;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+void StaticBakePinClock(double seconds) {
+    sClockPinned = seconds >= 0.0 ? seconds : -1.0;
+    sClockNow = sClockPinned >= 0.0 ? sClockPinned : RealClockSeconds(); // from the next draw, not frame
+}
+
+bool StaticBakeClockIsPinned() {
+    return sClockPinned >= 0.0;
+}
+
+double StaticBakeClockSeconds() {
+    return sClockNow;
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +896,8 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
     d.depthTestAndMask = depthTestAndMask;
     d.alphaBlend = alphaBlend;
     d.primDepth = primDepth;
+    // Closed before it changes, like the cull mode: what every buffered triangle was emitted under.
+    memcpy(d.scroll, sRecordScroll, sizeof(d.scroll));
 
     // Hold the textures the batch was drawn with, for every slot the program samples. What the
     // backend has bound right now is this batch's: GfxSpTri1 flushes before it imports a texture
@@ -838,11 +1024,24 @@ void StaticBakeNoteMaterial(Interpreter* gfx, const StaticBakeMaterial& m) {
     // different inputs, and the interpreter does not flush between them (the program did not
     // change; only which input is fed the vertex colour did). The replay shader lights a fixed
     // input, so one baked draw can only have one mask.
+    //
+    // And the scroll rates (#187 A1): the replay gives a draw one offset, so a texture that scrolls at
+    // another rate is another draw. Each slot's rate is its texture's registration, if the combiner
+    // reads it. In practice a texture change has already flushed (GfxSpTri1 flushes before it imports
+    // one), so this closes nothing new today; it is what keeps the stamp right if that order changes.
     const uint8_t cull = m.cullCode > STATIC_BAKE_CULL_BACK ? (uint8_t)STATIC_BAKE_CULL_NONE : m.cullCode;
-    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask) {
-        gfx->Flush(); // captures what is buffered under the *previous* mode and mask
+    float scroll[4] = {};
+    for (int i = 0; i < STATIC_BAKE_TEXTURE_SLOTS; i++) {
+        const TextureCacheNode* node = gfx->mRenderingState.mTextures[i];
+        if (m.combTextures[i] && node != nullptr) {
+            ScrollRateOf(node->first.texture_addr, &scroll[2 * i]);
+        }
+    }
+    if (cull != sRecordCull || m.shadeMask != sRecordShadeMask || memcmp(scroll, sRecordScroll, sizeof(scroll)) != 0) {
+        gfx->Flush(); // captures what is buffered under the *previous* mode, mask and rates
         sRecordCull = cull;
         sRecordShadeMask = m.shadeMask;
+        memcpy(sRecordScroll, scroll, sizeof(scroll));
     }
 }
 
@@ -864,6 +1063,41 @@ void StaticBakeEndFrame(Interpreter* gfx) {
     }
 }
 
+void StaticBakeBeginFrame() {
+    sClockNow = sClockPinned >= 0.0 ? sClockPinned : RealClockSeconds();
+}
+
+void StaticBakeNoteTexture(const char* path, const void* imageData, const std::shared_ptr<Texture>& owner) {
+    if (sScrollByPath.empty() || path == nullptr || imageData == nullptr) {
+        return;
+    }
+    auto it = sScrollByPath.find(StripOtr(path));
+    if (it == sScrollByPath.end()) {
+        return;
+    }
+    ScrollReg& reg = it->second;
+    if (reg.image == imageData) {
+        return; // the usual case: bound on an earlier frame, to the resource still held
+    }
+    // First resolve, or the path now resolves to a new resource (the alt-assets toggle reloads it).
+    // The old address leaves the lookup as the old resource is let go, so it can never stand for
+    // whatever is allocated there next.
+    Unbind(reg);
+    reg.image = imageData;
+    reg.owner = owner;
+    sScrollByImage[imageData] = { reg.rate[0], reg.rate[1] };
+    gStaticBakeScrollsBound = true;
+}
+
+bool StaticBakeTextureScrollOffset(const void* imageData, float out[2]) {
+    float rate[2];
+    if (!ScrollRateOf(imageData, rate)) {
+        return false;
+    }
+    ScrollOffsetNow(rate, out);
+    return true;
+}
+
 } // namespace Fast
 
 #else // !ENABLE_STATIC_BAKE
@@ -871,6 +1105,7 @@ void StaticBakeEndFrame(Interpreter* gfx) {
 namespace Fast {
 
 bool gStaticBakeRecording = false;
+bool gStaticBakeScrollsBound = false;
 
 void StaticBakeSetEnabled(bool) {
 }
@@ -902,6 +1137,26 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 
 StaticBakeEntryInfo StaticBakeGetEntry(const void*) {
     return {};
+}
+
+std::vector<StaticBakeScrollingEntry> StaticBakeGetScrollingEntries() {
+    return {};
+}
+bool StaticBakeSetTextureScroll(const char*, float, float) {
+    return false;
+}
+void StaticBakeClearTextureScrolls() {
+}
+std::vector<StaticBakeTextureScroll> StaticBakeGetTextureScrolls() {
+    return {};
+}
+void StaticBakePinClock(double) {
+}
+bool StaticBakeClockIsPinned() {
+    return false;
+}
+double StaticBakeClockSeconds() {
+    return 0.0;
 }
 
 } // namespace Fast
