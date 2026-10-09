@@ -1797,7 +1797,12 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         float ob[3] = { (float)v->ob[0], (float)v->ob[1], (float)v->ob[2] };
         d->windCode = 0;
+        d->alphaFlag = 0;
 #ifdef ENABLE_STATIC_BAKE
+        // THROWAWAY #205: an archive vertex's animated-alpha flag, kept for GfxSpTri1.
+        if (archiveFlags && StaticBakeIsAlphaFlag(v->flag)) {
+            d->alphaFlag = v->flag;
+        }
         if (windDecode) {
             const uint16_t code = StaticBakeWindCode(v->flag);
             if (code != 0) {
@@ -2506,10 +2511,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mBufVbo[mBufVboLen++] = mRdp->blend_color.b / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.a / 255.0f;
             } else {
+#ifdef ENABLE_STATIC_BAKE
+                if (bakeRecording && !is_rect && v_arr[i]->alphaFlag != 0) {
+                    // THROWAWAY #205: (curve, phase, 0, -1) for the replay shader's alpha curve.
+                    mBufVbo[mBufVboLen++] = (float)((v_arr[i]->alphaFlag >> 7) & 7);
+                    mBufVbo[mBufVboLen++] = (float)(v_arr[i]->alphaFlag & 0x7F) * (1.0f / 128.0f);
+                    mBufVbo[mBufVboLen++] = 0.0f;
+                    mBufVbo[mBufVboLen++] = -1.0f;
+                    StaticBakeNoteAlphaVertex(true);
+                } else
+#endif
+                {
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
                 mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+                }
             }
         }
 
@@ -2604,13 +2621,27 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     mBufVbo[mBufVboLen++] = color->g / 255.0f;
                     mBufVbo[mBufVboLen++] = color->b / 255.0f;
                 } else {
+                    float alphaOut;
                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for standard fog, blend color mode preserves
                         // it since fog alpha is the blend factor
-                        mBufVbo[mBufVboLen++] = 1.0f;
+                        alphaOut = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        alphaOut = color->a / 255.0f;
                     }
+#ifdef ENABLE_STATIC_BAKE
+                    // THROWAWAY #205: the vertex's alpha curve now, as the replay shader applies it.
+                    if (!bakeRecording && v_arr[i]->alphaFlag != 0) {
+                        alphaOut = alphaOut - StaticBakeAlphaDelta(v_arr[i]->alphaFlag);
+                        if (alphaOut < 0.0f) {
+                            alphaOut = 0.0f;
+                        }
+                        if (j == 0) {
+                            StaticBakeNoteAlphaVertex(false);
+                        }
+                    }
+#endif
+                    mBufVbo[mBufVboLen++] = alphaOut;
                 }
             }
         }

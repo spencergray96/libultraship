@@ -8,6 +8,7 @@
 #include <string>
 #include <tuple>
 #include "gfx_rendering_api.h"
+#include "../StaticMeshCache.h" // THROWAWAY #205: StaticBakeAlphaTable
 #include "d3d11.h"
 #include "d3dcompiler.h"
 
@@ -257,6 +258,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeAnimCb;
     StaticBakeAnimUniforms mStaticBakeAnimCbData = {};
     bool mStaticBakeAnimCbValid = false;
+    // THROWAWAY #205: the alpha curves, slot STATIC_BAKE_ANIM_CB_SLOT + 1, re-sent when their generation moves.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeAlphaCb;
+    StaticBakeAlphaTable mStaticBakeAlphaCbData = {};
+    bool mStaticBakeAlphaCbValid = false;
+    uint32_t mStaticBakeAlphaCbGeneration = 0;
     // Rasterizer states for baked draws, indexed cullMode * 2 + zmodeDecal. Built on demand and
     // kept, because a baked draw binds one every frame.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mStaticRasterizers[6];

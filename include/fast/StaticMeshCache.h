@@ -295,6 +295,47 @@ struct StaticBakeWindStats {
 StaticBakeWindStats StaticBakeGetWindStats();
 
 // ---------------------------------------------------------------------------
+// THROWAWAY (sturdy-bassoon#205 discovery): animated alpha in the replay, per vertex.
+//
+// An archive vertex whose Flag is in the alpha form, (flag & 0xC000) == 0x4000, takes a curve (bits
+// 7-9, 0-7) and a phase (bits 0-6, phase / 128 of the curve's loop). A curve is up to 16 frames, each
+// an end (a fraction of the loop) and a delta in alpha (RS's transparency step over 255): at clock t
+// the frame is the first whose end is past frac(t / loop + phase), and every alpha input of the
+// vertex's triangle loses that delta, clamped at 0. RS's type-5 transform is exactly this: a frame's
+// transparency is the rest's plus a delta, clamped. The curves belong to the frame, not to a
+// recording, so a change needs no rebake.
+//
+// Baked, the recorder carries the curve and phase in the vertex's FOG attribute (the replay recomputes
+// fog and never reads what was recorded there): (curve, phase / 128, 0, -1). So only a fogged
+// translucent material animates baked; the interpreter animates any.
+constexpr uint16_t STATIC_BAKE_ALPHA_FLAG_MASK = 0xC000;
+constexpr uint16_t STATIC_BAKE_ALPHA_FLAG_MARK = 0x4000;
+constexpr int STATIC_BAKE_ALPHA_CURVES = 8;
+constexpr int STATIC_BAKE_ALPHA_FRAMES = 16;
+constexpr bool StaticBakeIsAlphaFlag(uint16_t flag) {
+    return (flag & STATIC_BAKE_ALPHA_FLAG_MASK) == STATIC_BAKE_ALPHA_FLAG_MARK;
+}
+// Mirrored by the HLSL cbuffer StaticBakeAlphaCB: now.x the clock; per curve nine registers: [0].x the
+// loop in seconds (0 = unused), [0].y the frame count, [1-4] 16 ends, [5-8] 16 deltas.
+struct StaticBakeAlphaTable {
+    float now[4];
+    float curve[STATIC_BAKE_ALPHA_CURVES][9][4];
+};
+static_assert(sizeof(StaticBakeAlphaTable) == 16 + STATIC_BAKE_ALPHA_CURVES * 9 * 16, "float4 registers");
+bool StaticBakeSetAlphaCurve(int index, float loopSeconds, int frames, const float* ends, const float* deltas);
+void StaticBakeClearAlphaCurves();
+// The table now, and a generation bumped whenever it changes (each frame, with the clock).
+const StaticBakeAlphaTable& StaticBakeAlphaTableNow(uint32_t* generation);
+// The delta for a vertex flag now (0-1 alpha units), as the replay shader computes it.
+float StaticBakeAlphaDelta(uint16_t flag);
+struct StaticBakeAlphaStats {
+    uint32_t interpVertices = 0;   // vertex corners the interpreter faded, last frame
+    uint32_t recordedVertices = 0; // vertex corners recorded with a code, since start
+};
+StaticBakeAlphaStats StaticBakeGetAlphaStats();
+void StaticBakeNoteAlphaVertex(bool recorded);
+
+// ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------
 

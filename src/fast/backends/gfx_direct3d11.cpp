@@ -1026,7 +1026,8 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //   * bends a vertex that carries a wind code in position.w, from the same buffer (wind in the
 //     replay, #209 W1): along uWindB, or along its own direction at uWindB's length. A vertex
 //     recorded without wind (w = 1 or 2) is not touched.
-static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0) {
+static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0,
+                                  bool hasAlpha, int numInputs) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
     static const char* kUv0Marker = "result.uv0 = uv0;";
@@ -1074,6 +1075,25 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); #209 W1
           "    float4 uWindB;\n"    // bend at weight 1 along the wind (xyz), ripple (w); #209 W1
           "};\n\n";
+    // THROWAWAY #205: StaticBakeAlphaTable, and the delta for a vertex's (curve, phase) now.
+    cb += "cbuffer StaticBakeAlphaCB : register(b";
+    cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT + 1);
+    cb += ") {\n"
+          "    float4 uAlphaNow;\n"
+          "    float4 uAlphaCurve[" + std::to_string(STATIC_BAKE_ALPHA_CURVES * 9) + "];\n"
+          "};\n\n"
+          "float StaticBakeAlphaDelta(float2 code) {\n"
+          "    int c = (int)code.x * 9;\n"
+          "    float loopS = uAlphaCurve[c].x;\n"
+          "    if (!(loopS > 0.0)) { return 0.0; }\n"
+          "    float t = uAlphaNow.x / loopS + code.y;\n"
+          "    t = t - floor(t);\n"
+          "    float d = 0.0;\n"
+          "    [unroll] for (int i = 15; i >= 0; i--) {\n"
+          "        if (t < uAlphaCurve[c + 1 + (i >> 2)][i & 3]) { d = uAlphaCurve[c + 5 + (i >> 2)][i & 3]; }\n"
+          "    }\n"
+          "    return d;\n"
+          "}\n\n";
 
     if (shadeMask != 0) {
         // GfxSpVertex's directional-light sum, in its own order and units: start from the ambient
@@ -1116,6 +1136,21 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         }
         src.insert(end + 1,
                    "\n    if (fmod(position.w, 4.0) > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
+    }
+
+    // THROWAWAY #205: a vertex recorded with an alpha code in its fog slot (w = -1) fades every alpha
+    // input by its curve now, as GfxSpTri1 does when it draws interpreted.
+    if (hasAlpha && hasFog) {
+        for (int j = 0; j < numInputs; j++) {
+            const std::string name = "result.input" + std::to_string(j + 1);
+            const size_t at = src.find(name + " = ", vsAt + cb.size());
+            const size_t end = at == std::string::npos ? std::string::npos : src.find(';', at);
+            if (end == std::string::npos) {
+                return false;
+            }
+            src.insert(end + 1, "\n    if (fog.w < -0.5) { " + name + ".a = saturate(" + name +
+                                    ".a - StaticBakeAlphaDelta(fog.xy)); }");
+        }
     }
 
     // The scroll: the texture slides under triangles that never move. Added after the recorded,
@@ -1198,7 +1233,8 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
                      shadeMask, cc_features.numInputs, base->shader_id0, base->shader_id1);
         return nullptr;
     }
-    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0])) {
+    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0],
+                               cc_features.opt_alpha, cc_features.numInputs)) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");
@@ -1454,9 +1490,20 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const 
                             sizeof(StaticBakeAnimUniforms))) {
         return;
     }
+    // THROWAWAY #205: the alpha curves, re-sent only when their generation moves (once a frame).
+    uint32_t alphaGen = 0;
+    const StaticBakeAlphaTable& alphaTable = StaticBakeAlphaTableNow(&alphaGen);
+    if (alphaGen != mStaticBakeAlphaCbGeneration || !mStaticBakeAlphaCbValid) {
+        mStaticBakeAlphaCbValid = false;
+        if (!UploadStaticBakeCb(mStaticBakeAlphaCb, &mStaticBakeAlphaCbData, mStaticBakeAlphaCbValid, &alphaTable,
+                                sizeof(StaticBakeAlphaTable))) {
+            return;
+        }
+        mStaticBakeAlphaCbGeneration = alphaGen;
+    }
     static_assert(STATIC_BAKE_ANIM_CB_SLOT == STATIC_BAKE_CB_SLOT + 1, "both buffers bind in one call");
-    ID3D11Buffer* const cbs[2] = { mStaticBakeCb.Get(), mStaticBakeAnimCb.Get() };
-    mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 2, cbs);
+    ID3D11Buffer* const cbs[3] = { mStaticBakeCb.Get(), mStaticBakeAnimCb.Get(), mStaticBakeAlphaCb.Get() };
+    mContext->VSSetConstantBuffers(STATIC_BAKE_CB_SLOT, 3, cbs);
 
     const uint32_t stride = variant->numFloats * sizeof(float);
     const uint32_t offset = (uint32_t)draw.byteOffset;

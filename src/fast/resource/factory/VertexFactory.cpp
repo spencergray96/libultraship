@@ -62,7 +62,7 @@ ResourceFactoryXMLVertexV0::ReadResource(std::shared_ptr<Ship::File> file,
             // as 0, as every flag did before: an archive from another tool bends only if it writes the
             // marker itself.
             const unsigned int flag = child->UnsignedAttribute("Flag", 0);
-            data.v.flag = flag <= 0xFFFF && StaticBakeWindCode((uint16_t)flag) != 0 ? (uint16_t)flag : 0;
+            data.v.flag = flag <= 0xFFFF && (StaticBakeWindCode((uint16_t)flag) != 0 || StaticBakeIsAlphaFlag((uint16_t)flag)) ? (uint16_t)flag : 0; // THROWAWAY #205: or the alpha form
             data.v.tc[0] = child->IntAttribute("S");
             data.v.tc[1] = child->IntAttribute("T");
             data.v.cn[0] = child->IntAttribute("R");

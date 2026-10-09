@@ -870,6 +870,75 @@ StaticBakeWindStats StaticBakeGetWindStats() {
     return sWindLast;
 }
 
+// THROWAWAY #205: the alpha curves (fast/StaticMeshCache.h).
+static StaticBakeAlphaTable sAlpha = {};
+static uint32_t sAlphaGeneration = 1;
+static StaticBakeAlphaStats sAlphaNow;
+static StaticBakeAlphaStats sAlphaLast;
+static uint32_t sAlphaRecorded = 0;
+
+bool StaticBakeSetAlphaCurve(int index, float loopSeconds, int frames, const float* ends, const float* deltas) {
+    if (index < 0 || index >= STATIC_BAKE_ALPHA_CURVES || frames < 1 || frames > STATIC_BAKE_ALPHA_FRAMES ||
+        !(loopSeconds > 0.0f)) {
+        return false;
+    }
+    float(*c)[4] = sAlpha.curve[index];
+    memset(c, 0, sizeof(sAlpha.curve[index]));
+    c[0][0] = loopSeconds;
+    c[0][1] = (float)frames;
+    for (int i = 0; i < STATIC_BAKE_ALPHA_FRAMES; i++) {
+        // Past the last frame: an end no t reaches, and the last frame's delta.
+        c[1 + (i >> 2)][i & 3] = i < frames ? ends[i] : 2.0f;
+        c[5 + (i >> 2)][i & 3] = i < frames ? deltas[i] : deltas[frames - 1];
+    }
+    sAlphaGeneration++;
+    return true;
+}
+
+void StaticBakeClearAlphaCurves() {
+    memset(sAlpha.curve, 0, sizeof(sAlpha.curve));
+    sAlphaGeneration++;
+}
+
+const StaticBakeAlphaTable& StaticBakeAlphaTableNow(uint32_t* generation) {
+    if (generation != nullptr) {
+        *generation = sAlphaGeneration;
+    }
+    return sAlpha;
+}
+
+float StaticBakeAlphaDelta(uint16_t flag) {
+    const int c = (flag >> 7) & 7;
+    const float phase = (float)(flag & 0x7F) * (1.0f / 128.0f);
+    const float loop = sAlpha.curve[c][0][0];
+    if (!(loop > 0.0f)) {
+        return 0.0f;
+    }
+    float t = sAlpha.now[0] / loop + phase;
+    t = t - floorf(t);
+    float d = 0.0f;
+    for (int i = STATIC_BAKE_ALPHA_FRAMES - 1; i >= 0; i--) {
+        if (t < sAlpha.curve[c][1 + (i >> 2)][i & 3]) {
+            d = sAlpha.curve[c][5 + (i >> 2)][i & 3];
+        }
+    }
+    return d;
+}
+
+StaticBakeAlphaStats StaticBakeGetAlphaStats() {
+    StaticBakeAlphaStats s = sAlphaLast;
+    s.recordedVertices = sAlphaRecorded;
+    return s;
+}
+
+void StaticBakeNoteAlphaVertex(bool recorded) {
+    if (recorded) {
+        sAlphaRecorded++;
+    } else {
+        sAlphaNow.interpVertices++;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interpreter-facing API
 // ---------------------------------------------------------------------------
@@ -1142,6 +1211,10 @@ void StaticBakeBeginFrame() {
     gStaticBakeWindGeneration++; // a new clock value: every list's wind phase moves on
     sWindLast = sWindNow;
     sWindNow = {};
+    sAlpha.now[0] = (float)sClockNow; // THROWAWAY #205
+    sAlphaGeneration++;
+    sAlphaLast = sAlphaNow;
+    sAlphaNow = {};
 }
 
 void StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4], bool fromInterpreter) {
@@ -1307,6 +1380,26 @@ StaticBakeWind StaticBakeGetWind() {
 }
 StaticBakeWindStats StaticBakeGetWindStats() {
     return {};
+}
+static StaticBakeAlphaTable sAlphaStub = {};
+bool StaticBakeSetAlphaCurve(int, float, int, const float*, const float*) {
+    return false;
+}
+void StaticBakeClearAlphaCurves() {
+}
+const StaticBakeAlphaTable& StaticBakeAlphaTableNow(uint32_t* generation) {
+    if (generation != nullptr) {
+        *generation = 0;
+    }
+    return sAlphaStub;
+}
+float StaticBakeAlphaDelta(uint16_t) {
+    return 0.0f;
+}
+StaticBakeAlphaStats StaticBakeGetAlphaStats() {
+    return {};
+}
+void StaticBakeNoteAlphaVertex(bool) {
 }
 bool StaticBakeSetTextureScroll(const char*, float, float) {
     return false;

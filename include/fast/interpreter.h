@@ -235,6 +235,7 @@ struct LoadedVertex {
     // Wind in the replay (sturdy-bassoon#209 W1): the wind code (StaticBakeWindCode) a record pass
     // carries into the recording's w, 0 for a vertex without wind and outside a record pass.
     uint16_t windCode;
+    uint16_t alphaFlag; // THROWAWAY #205: an archive vertex's alpha-form Flag, else 0
 };
 
 struct RawTexMetadata {
