@@ -617,6 +617,30 @@ int32_t gfx_check_image_signature(const char* imgData);
 const char* gfx_get_shader(int16_t id);
 const char* GfxGetOpcodeName(int8_t opcode);
 
+// Boundary fog (sturdy-bassoon#169): under world-unit fog (fog_world), a vertex's fog factor is the larger of
+// its depth fog and a ramp by how far its world position lies past the playable area - clear out to b0 world
+// units outside it, complete at b1. The area is a list of axis-aligned rectangles {x0, z0, x1, z1} in world
+// units (x0 < x1, z0 < z1), the grid tool's playableRects; the distance past it is the least Euclidean
+// distance to any of them, 0 inside. Set by the game once per frame (not a display-list command: it is one
+// per scene, and no list needs its own); GfxSpVertex and the bake's replay read the same copy. It draws only
+// while the RSP is in world-unit fog, so a vanilla fog command switches it off with the band. At most
+// FOG_BOUNDARY_MAX_RECTS rectangles (gfx_rendering_api.h).
+struct FogBoundary {
+    uint32_t count;                         // 0: no boundary term
+    float mul;                              // 255 / (b1 - b0)
+    float offset;                           // -b0 * mul: the ramp is distance * mul + offset, 0..255
+    float rects[FOG_BOUNDARY_MAX_RECTS][4]; // {x0, z0, x1, z1}
+};
+// The caller applies the cap: past FOG_BOUNDARY_MAX_RECTS it passes the area's bounding box, which never fogs
+// playable ground (WorldFog_SetBoundary, sceneTemplate.ts fogBoundaryRects). A count past it here is a caller bug,
+// and only the first FOG_BOUNDARY_MAX_RECTS are kept. b1 <= b0 is drawn as b1 = b0 + 1.
+void FogBoundarySet(const float (*rects)[4], uint32_t count, float b0, float b1);
+void FogBoundaryClear();
+const FogBoundary& FogBoundaryNow();
+// The distance past the boundary at world (x, z): what GfxSpVertex ramps, and what `fog edge status` reports.
+// 0 inside; with no rectangles, 0.
+float FogBoundaryDistance(const FogBoundary& boundary, float x, float z);
+
 } // namespace Fast
 
 extern "C" void gfx_texture_cache_clear();

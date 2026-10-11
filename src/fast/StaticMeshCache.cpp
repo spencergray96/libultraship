@@ -403,6 +403,21 @@ void Replay(Interpreter* gfx, Entry& e) {
     u.fogWorld[1] = gfx->mRsp->fog_world_offset;
     u.fogWorld[2] = gfx->mRsp->fog_world ? 1.0f : 0.0f;
     u.fogWorld[3] = 0.0f;
+    // Boundary fog (sturdy-bassoon#169), as GfxSpVertex applies it: only under world-unit fog, and from the
+    // same copy. The modelview's world-x and world-z columns go with it, so the shader reads the recorded
+    // object-space position in world space under whatever matrix the list is submitted with.
+    const FogBoundary& edge = FogBoundaryNow();
+    if (gfx->mRsp->fog_world && edge.count != 0 && gfx->mRsp->modelview_matrix_stack_size != 0) {
+        const float(*mv)[4] = gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1];
+        u.fogEdge[0] = edge.mul;
+        u.fogEdge[1] = edge.offset;
+        u.fogEdge[2] = (float)edge.count;
+        for (int r = 0; r < 4; r++) {
+            u.fogEdgeModel[0][r] = mv[r][0];
+            u.fogEdgeModel[1][r] = mv[r][2];
+        }
+        memcpy(u.fogEdgeRects, edge.rects, edge.count * sizeof(edge.rects[0]));
+    }
 
     // The lights, as GfxSpVertex would read them for this display list: the last one is the
     // ambient, and each directional light's direction goes through CalculateNormalDir under the

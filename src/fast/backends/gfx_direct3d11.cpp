@@ -1073,6 +1073,11 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           maxLights +
           "];\n"
           "    float4 uFogWorld;\n" // sturdy-bassoon#167: x mul, y offset (over clip w), z 1 = world mode
+          "    float4 uFogEdge;\n"  // sturdy-bassoon#169: x mul, y offset (over the distance past), z rect count
+          "    float4 uFogEdgeModel[2];\n" // the modelview's world-x and world-z columns
+          "    float4 uFogEdgeRects[" +
+          std::to_string(FOG_BOUNDARY_MAX_RECTS) +
+          "];\n" // {x0, z0, x1, z1}, world units
           "};\n\n";
     // StaticBakeAnimUniforms, member for member: four float4 registers.
     cb += "cbuffer StaticBakeAnimCB : register(b";
@@ -1207,11 +1212,26 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
         // the floor: the interpreter stores the factor in a uint8_t colour channel, so the
         // quantization is part of the picture, not an artefact of it. World-unit fog
         // (sturdy-bassoon#167) is the same line over the guarded clip w, the view depth, as GfxSpVertex's.
+        // Boundary fog (sturdy-bassoon#169) is GfxSpVertex's next line in its order: the bent position to world
+        // x and z through the modelview's columns, each rectangle's per-axis gap, the hypotenuse, the least of
+        // them, the ramp, and the larger of it and the depth fog before the clamp. Replay leaves uFogEdge.z at
+        // 0 outside world-unit fog, so the term never draws then.
         std::string fogCode = "float bakeW = abs(bakeClip.w) < 0.001 ? 0.001 : bakeClip.w;\n"
                               "        float bakeWinv = 1.0 / bakeW;\n"
                               "        if (bakeWinv < 0.0) { bakeWinv = 32767.0; }\n"
                               "        float bakeFogIn = uFogWorld.z > 0.5 ? bakeW * uFogWorld.x + uFogWorld.y\n"
                               "            : bakeClip.z * bakeWinv * uFogParams.x + uFogParams.y;\n"
+                              "        if (uFogEdge.z > 0.5) {\n"
+                              "            float4 bakeP = float4(bakePos, 1.0);\n"
+                              "            float2 bakeXZ = float2(dot(bakeP, uFogEdgeModel[0]), dot(bakeP, uFogEdgeModel[1]));\n"
+                              "            float bakeDist = 3.0e38;\n"
+                              "            uint bakeRects = (uint)uFogEdge.z;\n"
+                              "            for (uint bakeI = 0; bakeI < bakeRects; bakeI++) {\n"
+                              "                float2 bakeGap = max(max(uFogEdgeRects[bakeI].xy - bakeXZ, bakeXZ - uFogEdgeRects[bakeI].zw), 0.0);\n"
+                              "                bakeDist = min(bakeDist, sqrt(bakeGap.x * bakeGap.x + bakeGap.y * bakeGap.y));\n"
+                              "            }\n"
+                              "            bakeFogIn = max(bakeFogIn, bakeDist * uFogEdge.x + uFogEdge.y);\n"
+                              "        }\n"
                               "        float bakeFog = floor(clamp(bakeFogIn, 0.0, 255.0)) / 255.0;\n"
                               "        result.fog = float4(uFogColor.rgb, bakeFog);";
         const size_t fogAt = src.find(kFogMarker);

@@ -1774,6 +1774,50 @@ static void BendForWind(float ob[3], uint16_t code, const float k[4], const floa
 }
 #endif
 
+// Boundary fog (sturdy-bassoon#169; interpreter.h FogBoundary). One copy, set by the game each frame, read by
+// GfxSpVertex below and by the bake's replay (StaticMeshCache.cpp Replay), which hands it to the patched
+// vertex shader as uniforms.
+static FogBoundary sFogBoundary = {};
+
+void FogBoundarySet(const float (*rects)[4], uint32_t count, float b0, float b1) {
+    if (rects == nullptr || count == 0) {
+        sFogBoundary.count = 0;
+        return;
+    }
+    count = std::min(count, FOG_BOUNDARY_MAX_RECTS);
+    if (b1 <= b0) {
+        b1 = b0 + 1.0f; // never divide by zero on a bad ramp
+    }
+    sFogBoundary.mul = 255.0f / (b1 - b0);
+    sFogBoundary.offset = -b0 * sFogBoundary.mul;
+    memcpy(sFogBoundary.rects, rects, count * sizeof(sFogBoundary.rects[0]));
+    sFogBoundary.count = count;
+}
+
+void FogBoundaryClear() {
+    sFogBoundary.count = 0;
+}
+
+const FogBoundary& FogBoundaryNow() {
+    return sFogBoundary;
+}
+
+// The grid tool's distanceOutside (playableArea.ts), in the replay shader's order (StaticBakePatchSource): per
+// rectangle each axis's gap outside it, the hypotenuse, the least over all rectangles.
+float FogBoundaryDistance(const FogBoundary& boundary, float x, float z) {
+    if (boundary.count == 0) {
+        return 0.0f;
+    }
+    float best = 3.0e38f;
+    for (uint32_t i = 0; i < boundary.count; i++) {
+        const float* r = boundary.rects[i];
+        const float gx = std::max(std::max(r[0] - x, x - r[2]), 0.0f);
+        const float gz = std::max(std::max(r[1] - z, z - r[3]), 0.0f);
+        best = std::min(best, sqrtf(gx * gx + gz * gz));
+    }
+    return best;
+}
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices, bool archiveFlags) {
 #ifdef ENABLE_STATIC_BAKE
     // Wind in the replay (sturdy-bassoon#209 W1). Only an archive's vertices are decoded (the guard:
@@ -2035,6 +2079,18 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // near plane interpolates the world factor exactly, since it is linear in clip-space w.
             float fog_z = mRsp->fog_world ? w * mRsp->fog_world_mul + mRsp->fog_world_offset
                                           : z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            // Boundary fog (sturdy-bassoon#169): under world-unit fog, the larger of the depth fog and the ramp
+            // by how far the vertex's world position lies past the playable area. The modelview holds the model
+            // transform only (OoT multiplies the view into the projection), so it takes ob - after any wind
+            // bend, as the projection did - to world space. Taken before the clamp, max(a, b) clamps to
+            // max(clamp(a), clamp(b)). The replay shader computes the same line (StaticBakePatchSource).
+            if (mRsp->fog_world && sFogBoundary.count != 0 && mRsp->modelview_matrix_stack_size != 0) {
+                const float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+                const float px = ob[0] * mv[0][0] + ob[1] * mv[1][0] + ob[2] * mv[2][0] + mv[3][0];
+                const float pz = ob[0] * mv[0][2] + ob[1] * mv[1][2] + ob[2] * mv[2][2] + mv[3][2];
+                fog_z = std::max(fog_z, FogBoundaryDistance(sFogBoundary, px, pz) * sFogBoundary.mul +
+                                            sFogBoundary.offset);
+            }
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {

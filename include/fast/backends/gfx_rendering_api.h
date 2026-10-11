@@ -33,6 +33,11 @@ enum StaticBakeCull : uint8_t {
 // the picture.
 constexpr int STATIC_BAKE_MAX_DIR_LIGHTS = 7;
 
+// Boundary fog's rectangles (sturdy-bassoon#169; interpreter.h FogBoundary): the most the playable area is
+// drawn with, in the interpreter and in the replay shader's cbuffer alike. F2P's 6 x 6 needs 1. The game's
+// WorldFog.h and the grid tool's sceneTemplate.ts mirror it; past it the export writes the area's bounding box.
+constexpr uint32_t FOG_BOUNDARY_MAX_RECTS = 8;
+
 // A recorded vertex that was lit under G_LIGHTING carries its raw object-space normal where its
 // lit colour would have gone, and this value in position.w to say so. Recorded w is otherwise
 // always exactly 1 (the record pass runs under a near-identity matrix), and the replay shader
@@ -72,7 +77,16 @@ struct StaticBakeUniforms {
     // fog_world_offset (the factor is clip w * x + y, 0..255), z 1 in world mode and 0 for vanilla, w 0.
     // Boundary fog's uniforms (sturdy-bassoon#169 stage 2) go after this one.
     float fogWorld[4];
+    // Boundary fog (sturdy-bassoon#169; interpreter.h FogBoundary), filled only while fogWorld.z is 1: x the
+    // ramp's mul, y its offset (the ramp is distance * x + y, 0..255), z the rectangle count (0: no term), w 0.
+    float fogEdge[4];
+    // The modelview's world-x and world-z columns, so the term reads the world position under any modelview:
+    // world x = dot(float4(objectPos, 1), fogEdgeModel[0]), world z with [1]. Room lists run under the identity.
+    float fogEdgeModel[2][4];
+    // The playable area's rectangles, {x0, z0, x1, z1} in world units; the first fogEdge.z are read.
+    float fogEdgeRects[FOG_BOUNDARY_MAX_RECTS][4];
 };
+static_assert(sizeof(StaticBakeUniforms) % 16 == 0, "StaticBakeCB is a whole number of float4 registers");
 
 // What moves in a baked draw: the second constant buffer on the replay's vertex stage
 // (sturdy-bassoon#187 A1, laid out by #208's record, section 7, so wind lands here as two filled
