@@ -57,12 +57,16 @@ ResourceFactoryXMLVertexV0::ReadResource(std::shared_ptr<Ship::File> file,
             data.v.ob[0] = child->IntAttribute("X");
             data.v.ob[1] = child->IntAttribute("Y");
             data.v.ob[2] = child->IntAttribute("Z");
-            // An archive vertex may carry wind (sturdy-bassoon#209 W1): its Flag attribute, kept only in
-            // the marker's form (fast/StaticMeshCache.h, STATIC_BAKE_WIND_FLAG_*). Any other value loads
-            // as 0, as every flag did before: an archive from another tool bends only if it writes the
-            // marker itself.
+            // An archive vertex may carry wind (sturdy-bassoon#209 W1) or a wobble (#216 W): its Flag
+            // attribute, kept only in one of the two forms (fast/StaticMeshCache.h,
+            // STATIC_BAKE_WIND_FLAG_* and STATIC_BAKE_WOBBLE_FLAG_*). Any other value loads as 0, as
+            // every flag did before: an archive from another tool bends or fades only if it writes a
+            // form itself.
             const unsigned int flag = child->UnsignedAttribute("Flag", 0);
-            data.v.flag = flag <= 0xFFFF && StaticBakeWindCode((uint16_t)flag) != 0 ? (uint16_t)flag : 0;
+            data.v.flag = flag <= 0xFFFF && (StaticBakeWindCode((uint16_t)flag) != 0 ||
+                                             StaticBakeWobbleCode((uint16_t)flag) != 0)
+                              ? (uint16_t)flag
+                              : 0;
             data.v.tc[0] = child->IntAttribute("S");
             data.v.tc[1] = child->IntAttribute("T");
             data.v.cn[0] = child->IntAttribute("R");

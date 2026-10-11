@@ -109,6 +109,7 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 // was recorded with a scroll rate, the draws that move (#187 A1; a rate on TEXEL1 alone is stamped but
 // not applied, so not counted). `windVertices` and `windTris` (#209 W1): the weighted vertices its
 // recording loaded, and the triangles with at least one weighted corner, the part that sways.
+// `wobbleVertices` and `wobbleTris` (#216 W): the same for wobble vertices, the part that fades.
 // `rejectReason` is a string literal naming why the recorder refused it, nullptr unless Rejected.
 enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
 struct StaticBakeEntryInfo {
@@ -119,6 +120,8 @@ struct StaticBakeEntryInfo {
     uint32_t scrollingTris = 0;
     uint32_t windVertices = 0;
     uint32_t windTris = 0;
+    uint32_t wobbleVertices = 0;
+    uint32_t wobbleTris = 0;
     const char* rejectReason = nullptr;
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
@@ -295,6 +298,107 @@ struct StaticBakeWindStats {
 StaticBakeWindStats StaticBakeGetWindStats();
 
 // ---------------------------------------------------------------------------
+// Wobble in the replay (sturdy-bassoon#216 W)
+//
+// A vertex that carries a wobble phase fades its alpha by a smooth periodic curve: a flame's
+// see-through faces rise and fall in transparency, RS-like rather than RS-exact (sturdy-bassoon ADR
+// 2026-10-07-animated-rs-props, decisions 31-37). Wind's pattern (above): a marker in the archive, carried
+// into the recording, faded by the replay's vertex stage from frame-level parameters and the clock, and
+// mirrored by the interpreter. With strength S (0-1), speed f (Hz) and the vertex's phase p (0-255),
+// every alpha input of the vertex is multiplied by
+//
+//     m = 1 - S x (1 - cos(2 pi (frac(f t) + p / 256))) / 2
+//
+// which runs between 1 (as recorded) and 1 - S, back at 1 once a cycle. S = 0 gives m = 1 exactly, the
+// still picture. The phase is the vertex's, so each placement in a map's list keeps its own timing: the
+// generator (W's import half) writes one per placement.
+//
+// THE FADE IS ON THE COLOUR INPUTS' ALPHA, not shade alpha and not fog: a translucent prop's alpha is its
+// prim colour (#216 T1; fog owns shade alpha), and every combiner input reaches the vertex stage as a
+// per-vertex attribute, prim and env included. So the replay multiplies `result.inputN.a` after the
+// pass-through, and the interpreter multiplies the same value as it writes it. Exact for a combiner whose
+// alpha is one input (`PRIMITIVE`, what the import writes); a combiner that mixes several alpha inputs
+// fades by a different curve, but baked and interpreted still agree. A material without alpha (opaque, no
+// blend) has no alpha inputs, so a wobble vertex in it draws as recorded. The fog factor, its slot and
+// shade alpha's own handling are not touched.
+//
+// THE CARRIER is Vtx_t.flag, in the half of its space wind leaves free (bit 15 clear; see
+// STATIC_BAKE_WOBBLE_FLAG_*), read from an archive vertex's XML `Flag`. A flag is wind or wobble, never
+// both: bit 15 set is wind's whatever the other bits hold, and the wobble form needs bit 15 clear. A
+// recording carries the phase in position.w as (1 or 2) + STATIC_BAKE_WIND_W_SCALE x code, the code above
+// wind's 1-32767: STATIC_BAKE_WOBBLE_W_CODE_BASE + p. No vertex attribute, and the recorded fog slot is
+// not used.
+//
+// THE GUARD is wind's: only vertices loaded from an XML vertex resource are decoded, and the XML reader
+// keeps a Flag only in the wind form or the wobble form.
+//
+// THE PARAMETERS belong to the frame (StaticBakeWobble), read every frame with the clock (pinnable), so a
+// change needs no rebake; only the phase is read at record time.
+//
+// NOT GATED, like wind and the scroll: with the bake off, or on a backend that cannot bake, the
+// interpreter fades the same vertices by the same curve.
+// ---------------------------------------------------------------------------
+
+// Vtx_t.flag, as an archive's XML `Flag` attribute writes it:
+//   bit 15      0 (1 is wind's: STATIC_BAKE_WIND_FLAG_MARK)
+//   bit 14      1: STATIC_BAKE_WOBBLE_FLAG_MARK, the vertex wobbles
+//   bits 8-13   0, reserved (a per-vertex depth or a group, if one is ever wanted). A flag with any of
+//               them set is not in the wobble form, and the XML reader drops it to 0
+//   bits 0-7    the phase p, 0-255: p / 256 of a cycle
+// So the wobble form is exactly 0x4000-0x40FF.
+constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_MARK = 0x4000;
+constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_FORM_MASK = 0xFF00; // bit 15, the mark and the reserved bits
+constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_PHASE_MASK = 0x00FF;
+// A recorded wobble vertex's code: this plus the phase, above every wind code (1-32767).
+constexpr uint32_t STATIC_BAKE_WOBBLE_W_CODE_BASE = 32768;
+
+// The code a flag carries into a recording, STATIC_BAKE_WOBBLE_W_CODE_BASE + p (32768-33023); 0 when it
+// does not wobble.
+constexpr uint16_t StaticBakeWobbleCode(uint16_t flag) {
+    return (flag & STATIC_BAKE_WOBBLE_FLAG_FORM_MASK) == STATIC_BAKE_WOBBLE_FLAG_MARK
+               ? (uint16_t)(STATIC_BAKE_WOBBLE_W_CODE_BASE + (flag & STATIC_BAKE_WOBBLE_FLAG_PHASE_MASK))
+               : (uint16_t)0;
+}
+// A flag is one or the other: the wobble form needs bit 15 clear, which every wind code has set, and the
+// two codes never meet in a recording's w.
+static_assert((STATIC_BAKE_WOBBLE_FLAG_FORM_MASK & STATIC_BAKE_WIND_FLAG_MARK) != 0 &&
+                  (STATIC_BAKE_WOBBLE_FLAG_MARK & STATIC_BAKE_WIND_FLAG_MARK) == 0,
+              "the wobble form needs the wind mark clear");
+static_assert(StaticBakeWobbleCode(0xC0FF) == 0 && StaticBakeWindCode(0xC0FF) != 0,
+              "a flag with both marks is wind's");
+static_assert(StaticBakeWobbleCode(0x40FF) != 0 && StaticBakeWindCode(0x40FF) == 0, "the wobble form is not wind");
+static_assert(StaticBakeWobbleCode(0x4100) == 0 && StaticBakeWobbleCode(0x4000) == STATIC_BAKE_WOBBLE_W_CODE_BASE,
+              "reserved bits set drop the form; phase 0 is a phase");
+static_assert(STATIC_BAKE_WOBBLE_W_CODE_BASE > 0x7FFF, "every wind code (1-32767) is below the wobble codes");
+
+// The frame's wobble. The defaults are the owner's pick on the #216 W bench.
+struct StaticBakeWobble {
+    float strength = 0.5f; // 0-1: how far alpha falls at the bottom of the cycle; 0 fades nothing
+    float speed = 1.0f;    // Hz: cycles a second
+
+    bool operator==(const StaticBakeWobble& o) const {
+        return strength == o.strength && speed == o.speed;
+    }
+};
+// Set the frame's wobble, from the next vertex drawn. Refused (false, nothing changed) when a value is not
+// finite, the strength is outside 0-1 or the speed is negative. Safe at any time on the game thread.
+bool StaticBakeSetWobble(const StaticBakeWobble& wobble);
+StaticBakeWobble StaticBakeGetWobble();
+
+// Every baked entry that recorded a wobble vertex (wobbleTris != 0: the same test the replay makes).
+std::vector<StaticBakeKeyedEntry> StaticBakeGetWobbleEntries();
+
+// What the wobble did in the last whole frame drawn:
+//   replayEntries   baked list entries replayed with the wobble on (a list holding wobble vertices while
+//                   the strength is non-zero)
+//   interpVertices  wobble vertices the interpreter faded (none of them baked)
+struct StaticBakeWobbleStats {
+    uint32_t replayEntries = 0;
+    uint32_t interpVertices = 0;
+};
+StaticBakeWobbleStats StaticBakeGetWobbleStats();
+
+// ---------------------------------------------------------------------------
 // Interpreter-facing API (libultraship internal)
 // ---------------------------------------------------------------------------
 
@@ -393,5 +497,20 @@ void StaticBakeWindLine(uint32_t line, float out[3]);
 // From GfxSpVertex: in a record pass, `n` weighted vertices were loaded into the list being recorded;
 // otherwise, `n` weighted vertices were bent on the CPU.
 void StaticBakeNoteWindVertices(uint32_t n);
+
+// Wobble, the interpreter's side (#216 W).
+//
+// True while the strength is non-zero: the gate on the interpreter's fade. A record pass notes the phases
+// whatever it is, because the strength is read at replay.
+extern bool gStaticBakeWobbleOn;
+// The multiplier m for a vertex with this code (StaticBakeWobbleCode) now, as the replay shader computes
+// it, in float: 1 while the strength is 0.
+float StaticBakeWobbleFactor(uint16_t code);
+// What the replay's StaticBakeAnimUniforms::wobble holds this frame: x the cycle now, frac(f t); y the
+// strength. Both 0 while the strength is 0.
+void StaticBakeWobbleNow(float out[4]);
+// From GfxSpVertex: in a record pass, `n` wobble vertices were loaded into the list being recorded;
+// otherwise, `n` wobble vertices were faded on the CPU.
+void StaticBakeNoteWobbleVertices(uint32_t n);
 
 } // namespace Fast

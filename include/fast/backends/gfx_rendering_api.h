@@ -43,6 +43,9 @@ constexpr float STATIC_BAKE_LIT_W = 2.0f;
 // STATIC_BAKE_WIND_W_SCALE x code carries a vertex's wind code (StaticBakeWindCode in
 // fast/StaticMeshCache.h: q + 256 x direction, 0-32767; at most 131070, exact in a float), so the lit
 // flag is w mod this. A vertex without wind records w = 1 or 2, exactly as before wind existed.
+// The wobble (sturdy-bassoon#216 W) rides the same scale with codes from 32768 up
+// (STATIC_BAKE_WOBBLE_W_CODE_BASE + phase, at most 33023): a code below that is wind's, one at or above
+// it the wobble's, so a recorded vertex carries one or the other.
 constexpr float STATIC_BAKE_WIND_W_SCALE = 4.0f;
 
 // Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the
@@ -84,8 +87,12 @@ struct StaticBakeAnimUniforms {
     // which bends nothing and keeps such a list's buffer exactly what it was before wind.
     float windK[4];
     float windB[4];
+    // Per list entry, the wobble (#216 W; StaticBakeWobbleNow): x the cycle now, frac(speed x clock); y the
+    // strength; zw 0. 0 for a list with no wobble vertex, or with the strength 0, which fades nothing and
+    // keeps such a list's buffer exactly what it was before the wobble.
+    float wobble[4];
 };
-static_assert(sizeof(StaticBakeAnimUniforms) == 48, "StaticBakeAnimCB is three float4 registers");
+static_assert(sizeof(StaticBakeAnimUniforms) == 64, "StaticBakeAnimCB is four float4 registers");
 
 // Texture slots a baked draw can bind: TEXEL0 and TEXEL1. The HD mask and blend slots behind them
 // (SHADER_FIRST_MASK_TEXTURE on) are refused at record time, so a baked draw never needs them.

@@ -19,6 +19,7 @@ bool gStaticBakeRecording = false;
 bool gStaticBakeScrollsBound = false;
 bool gStaticBakeWindOn = StaticBakeWind{}.amplitude != 0.0f;
 uint32_t gStaticBakeWindGeneration = 0;
+bool gStaticBakeWobbleOn = StaticBakeWobble{}.strength != 0.0f;
 
 namespace {
 
@@ -81,6 +82,10 @@ struct Entry {
     // corner. A list with none replays with the wind registers at 0, as it did before wind existed.
     uint32_t windVertices = 0;
     uint32_t windTris = 0;
+    // Wobble (#216 W): the same for wobble vertices. A list with none replays with the wobble register
+    // at 0, as it did before the wobble existed.
+    uint32_t wobbleVertices = 0;
+    uint32_t wobbleTris = 0;
     const char* rejectReason = nullptr; // a literal, set wherever state becomes Rejected
 };
 
@@ -179,10 +184,28 @@ StaticBakeWind sWind;
 StaticBakeWindStats sWindNow;
 StaticBakeWindStats sWindLast;
 
-// A recorded vertex's w is (1 or 2) + 4 x its wind code, so a code is there when w reaches 4.
+// The frame's wobble (sturdy-bassoon#216 W; the header's "Wobble in the replay"): the parameters, the
+// cycle now (frac(speed x clock), worked out in double once a frame and on each change), and what it did.
+StaticBakeWobble sWobble;
+float sWobbleCycle = 0.0f;
+StaticBakeWobbleStats sWobbleNow;
+StaticBakeWobbleStats sWobbleLast;
+
+// A recorded vertex's w is (1 or 2) + 4 x its code: a wind code 1-32767, or a wobble code from
+// STATIC_BAKE_WOBBLE_W_CODE_BASE up. Whole numbers below 2^24, so exact in a float.
 constexpr double kTau = 6.283185307179586;
+constexpr float kWobbleWFrom = STATIC_BAKE_WIND_W_SCALE * (float)STATIC_BAKE_WOBBLE_W_CODE_BASE;
 bool RecordedWeighted(float w) {
-    return w >= STATIC_BAKE_WIND_W_SCALE;
+    return w >= STATIC_BAKE_WIND_W_SCALE && w < kWobbleWFrom;
+}
+bool RecordedWobbling(float w) {
+    return w >= kWobbleWFrom;
+}
+
+// frac(speed x clock), in double so the cycle stays exact however long the session runs.
+void WobbleCycleNow() {
+    const double cycles = (double)sWobble.speed * sClockNow;
+    sWobbleCycle = (float)(cycles - std::floor(cycles));
 }
 
 // Opcodes the recorder understands. Anything else - a matrix load, a segment write, a branch_z -
@@ -269,6 +292,8 @@ void ReleaseGpu(Entry& e) {
     e.totalTris = 0;
     e.windVertices = 0;
     e.windTris = 0;
+    e.wobbleVertices = 0;
+    e.wobbleTris = 0;
 }
 
 void AbortRecording(Interpreter* gfx, const char* reason) {
@@ -398,6 +423,12 @@ void Replay(Interpreter* gfx, Entry& e) {
         const float(*mv)[4] = gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1];
         StaticBakeWindVectors(mv, anim.windK, anim.windB, false);
         sWindNow.replayEntries++;
+    }
+    // Wobble (#216 W): the frame's cycle and strength, for a list that recorded a wobble vertex only;
+    // every other list keeps the register at 0, so its buffer is exactly what it was without the wobble.
+    if (e.wobbleTris != 0 && gStaticBakeWobbleOn) {
+        StaticBakeWobbleNow(anim.wobble);
+        sWobbleNow.replayEntries++;
     }
 
     for (const BakedDraw& d : e.draws) {
@@ -629,13 +660,15 @@ void FinishRecording(Interpreter* gfx) {
 
     e->state = BakeState::Baked;
     // The draws the list would have in list order, and what ordering it by material cost, after the
-    // fields older run scripts parse; then the scrolling draws (#187 A1), and the wind (#209 W1).
+    // fields older run scripts parse; then the scrolling draws (#187 A1), the wind (#209 W1) and the
+    // wobble (#216 W).
     SPDLOG_INFO("[staticbake] baked display list {}: {} draws, {} tris, {} KB, {} textured draws, {} textures; "
-                "{} draws in list order, {}; {} scrolling draws; {} wind vertices in {} tris",
+                "{} draws in list order, {}; {} scrolling draws; {} wind vertices in {} tris; {} wobble vertices "
+                "in {} tris",
                 key, e->draws.size(), e->totalTris, (e->staging.size() * sizeof(float)) / 1024, texturedDraws,
                 held.size(), listOrderDraws,
                 sSortByMaterial ? fmt::format("sorted by material in {:.2f} ms", sortMs) : std::string("not sorted"),
-                scrollingDraws, e->windVertices, e->windTris);
+                scrollingDraws, e->windVertices, e->windTris, e->wobbleVertices, e->wobbleTris);
     e->staging.clear();
     e->staging.shrink_to_fit();
 
@@ -740,6 +773,8 @@ StaticBakeEntryInfo InfoOf(const Entry& e) {
             }
             info.windVertices = e.windVertices;
             info.windTris = e.windTris;
+            info.wobbleVertices = e.wobbleVertices;
+            info.wobbleTris = e.wobbleTris;
             break;
         case BakeState::Rejected:
             info.state = StaticBakeEntryState::Rejected;
@@ -775,6 +810,17 @@ std::vector<StaticBakeKeyedEntry> StaticBakeGetWindEntries() {
     for (const auto& kv : sEntries) {
         StaticBakeEntryInfo info = InfoOf(kv.second);
         if (info.windTris != 0) {
+            out.push_back({ kv.first, info });
+        }
+    }
+    return out;
+}
+
+std::vector<StaticBakeKeyedEntry> StaticBakeGetWobbleEntries() {
+    std::vector<StaticBakeKeyedEntry> out;
+    for (const auto& kv : sEntries) {
+        StaticBakeEntryInfo info = InfoOf(kv.second);
+        if (info.wobbleTris != 0) {
             out.push_back({ kv.first, info });
         }
     }
@@ -841,6 +887,7 @@ void StaticBakePinClock(double seconds) {
     sClockPinned = seconds >= 0.0 ? seconds : -1.0;
     sClockNow = sClockPinned >= 0.0 ? sClockPinned : RealClockSeconds(); // from the next draw, not frame
     gStaticBakeWindGeneration++;                                         // the wind's phase follows the clock
+    WobbleCycleNow();                                                    // and so does the wobble's
 }
 
 bool StaticBakeClockIsPinned() {
@@ -868,6 +915,25 @@ StaticBakeWind StaticBakeGetWind() {
 
 StaticBakeWindStats StaticBakeGetWindStats() {
     return sWindLast;
+}
+
+bool StaticBakeSetWobble(const StaticBakeWobble& wobble) {
+    if (!std::isfinite(wobble.strength) || !std::isfinite(wobble.speed) || wobble.strength < 0.0f ||
+        wobble.strength > 1.0f || wobble.speed < 0.0f) {
+        return false;
+    }
+    sWobble = wobble;
+    gStaticBakeWobbleOn = sWobble.strength != 0.0f;
+    WobbleCycleNow();
+    return true;
+}
+
+StaticBakeWobble StaticBakeGetWobble() {
+    return sWobble;
+}
+
+StaticBakeWobbleStats StaticBakeGetWobbleStats() {
+    return sWobbleLast;
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1018,11 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
         if (RecordedWeighted(tri[3]) || RecordedWeighted(tri[floatsPerVertex + 3]) ||
             RecordedWeighted(tri[2 * floatsPerVertex + 3])) {
             e->windTris++;
+        }
+        // And the triangles that fade (#216 W): a wobble code in the same slot.
+        if (RecordedWobbling(tri[3]) || RecordedWobbling(tri[floatsPerVertex + 3]) ||
+            RecordedWobbling(tri[2 * floatsPerVertex + 3])) {
+            e->wobbleTris++;
         }
     }
 
@@ -1142,6 +1213,9 @@ void StaticBakeBeginFrame() {
     gStaticBakeWindGeneration++; // a new clock value: every list's wind phase moves on
     sWindLast = sWindNow;
     sWindNow = {};
+    WobbleCycleNow();
+    sWobbleLast = sWobbleNow;
+    sWobbleNow = {};
 }
 
 void StaticBakeWindVectors(const float mv[4][4], float k[4], float b[4], bool fromInterpreter) {
@@ -1216,6 +1290,32 @@ void StaticBakeNoteWindVertices(uint32_t n) {
     }
 }
 
+float StaticBakeWobbleFactor(uint16_t code) {
+    if (!gStaticBakeWobbleOn || code < STATIC_BAKE_WOBBLE_W_CODE_BASE) {
+        return 1.0f;
+    }
+    // The replay shader's StaticBakeWobble, in float, in its order.
+    const float p = (float)(code - STATIC_BAKE_WOBBLE_W_CODE_BASE) * (1.0f / 256.0f);
+    return 1.0f - sWobble.strength * 0.5f * (1.0f - cosf((float)kTau * (sWobbleCycle + p)));
+}
+
+void StaticBakeWobbleNow(float out[4]) {
+    out[0] = gStaticBakeWobbleOn ? sWobbleCycle : 0.0f;
+    out[1] = gStaticBakeWobbleOn ? sWobble.strength : 0.0f;
+    out[2] = 0.0f;
+    out[3] = 0.0f;
+}
+
+void StaticBakeNoteWobbleVertices(uint32_t n) {
+    if (gStaticBakeRecording) {
+        if (sRecording != nullptr && !sRecordAborted) {
+            sRecording->wobbleVertices += n;
+        }
+    } else {
+        sWobbleNow.interpVertices += n;
+    }
+}
+
 void StaticBakeNoteTexture(const char* path, const void* imageData, const std::shared_ptr<Texture>& owner) {
     if (sScrollByPath.empty() || path == nullptr || imageData == nullptr) {
         return;
@@ -1257,6 +1357,7 @@ bool gStaticBakeRecording = false;
 bool gStaticBakeScrollsBound = false;
 bool gStaticBakeWindOn = false;
 uint32_t gStaticBakeWindGeneration = 0;
+bool gStaticBakeWobbleOn = false;
 
 void StaticBakeSetEnabled(bool) {
 }
@@ -1306,6 +1407,21 @@ StaticBakeWind StaticBakeGetWind() {
     return sWindStub;
 }
 StaticBakeWindStats StaticBakeGetWindStats() {
+    return {};
+}
+std::vector<StaticBakeKeyedEntry> StaticBakeGetWobbleEntries() {
+    return {};
+}
+// Held, as the wind is; nothing draws with it.
+static StaticBakeWobble sWobbleStub;
+bool StaticBakeSetWobble(const StaticBakeWobble& wobble) {
+    sWobbleStub = wobble;
+    return true;
+}
+StaticBakeWobble StaticBakeGetWobble() {
+    return sWobbleStub;
+}
+StaticBakeWobbleStats StaticBakeGetWobbleStats() {
     return {};
 }
 bool StaticBakeSetTextureScroll(const char*, float, float) {

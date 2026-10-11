@@ -1025,8 +1025,12 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //     second buffer, StaticBakeAnimCB. A still draw's offset is 0;
 //   * bends a vertex that carries a wind code in position.w, from the same buffer (wind in the
 //     replay, #209 W1): along uWindB, or along its own direction at uWindB's length. A vertex
-//     recorded without wind (w = 1 or 2) is not touched.
-static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0) {
+//     recorded without wind (w = 1 or 2) is not touched;
+//   * fades every alpha input of a vertex that carries a wobble code in position.w, from the same
+//     buffer (the wobble, sturdy-bassoon#216 W): result.inputN.a times StaticBakeWobble's factor. Only
+//     a program with alpha has alpha inputs to fade. A vertex recorded without one is not touched.
+static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0,
+                                  bool hasAlpha, int numInputs) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
     static const char* kUv0Marker = "result.uv0 = uv0;";
@@ -1066,14 +1070,26 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "];\n"
           "    float4 uLightColor[" +
           maxLights + "];\n};\n\n";
-    // StaticBakeAnimUniforms, member for member: three float4 registers.
+    // StaticBakeAnimUniforms, member for member: four float4 registers.
     cb += "cbuffer StaticBakeAnimCB : register(b";
     cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT);
     cb += ") {\n"
           "    float4 uUvOffset;\n" // xy TEXEL0's scroll offset; zw TEXEL1's, reserved for #201
           "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); #209 W1
           "    float4 uWindB;\n"    // bend at weight 1 along the wind (xyz), ripple (w); #209 W1
+          "    float4 uWobble;\n"   // cycle now (x), strength (y); #216 W
           "};\n\n";
+    // The wobble's factor for a recorded w (#216 W; StaticBakeWobbleFactor is the interpreter's mirror, in
+    // the same order): 1 for a code below STATIC_BAKE_WOBBLE_W_CODE_BASE, wind's or none; otherwise
+    // 1 - strength x (1 - cos(2 pi (cycle + phase / 256))) / 2. A list without wobble vertices has
+    // uWobble at 0, so the factor is 1 there too.
+    static_assert(STATIC_BAKE_WOBBLE_W_CODE_BASE == 32768, "the shader below splits wind and wobble codes at 32768");
+    cb += "float StaticBakeWobble(float w) {\n"
+          "    float code = floor(w * 0.25);\n"
+          "    if (code < 32768.0) { return 1.0; }\n"
+          "    float p = (code - 32768.0) * (1.0 / 256.0);\n"
+          "    return 1.0 - uWobble.y * 0.5 * (1.0 - cos(6.28318531 * (uWobble.x + p)));\n"
+          "}\n\n";
 
     if (shadeMask != 0) {
         // GfxSpVertex's directional-light sum, in its own order and units: start from the ambient
@@ -1118,6 +1134,22 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
                    "\n    if (fmod(position.w, 4.0) > 1.5) { " + name + ".rgb = StaticBakeLight(" + name + ".rgb); }");
     }
 
+    // The wobble (#216 W): each alpha input's pass-through line, `result.inputN = inputN;` in a program with
+    // alpha, gains a fade by the vertex's factor right after, as GfxSpTri1 multiplies the same value. Every
+    // input, as the interpreter does, so prim alpha fades (the import's translucent material reads it) and
+    // fog's own slot and its forced shade alpha are left as they are.
+    if (hasAlpha) {
+        for (int j = 0; j < numInputs; j++) {
+            const std::string name = "result.input" + std::to_string(j + 1);
+            const size_t at = src.find(name + " = ", vsAt + cb.size()); // within VSMain, not PSMain
+            const size_t end = at == std::string::npos ? std::string::npos : src.find(';', at);
+            if (end == std::string::npos) {
+                return false;
+            }
+            src.insert(end + 1, "\n    " + name + ".a *= StaticBakeWobble(position.w);");
+        }
+    }
+
     // The scroll: the texture slides under triangles that never move. Added after the recorded,
     // already tile-normalised coordinate, which is what the interpreter's mirror adds it to as well.
     if (samplesTexel0) {
@@ -1132,11 +1164,12 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     // sine of time and its position, before the camera - GfxSpVertex's formula on the same unbent
     // position. The code is q + 256 x line (StaticBakeWindCode): weight q / 255; line 0 bends along the
     // wind (uWindB), 1-127 along that horizontal line of the list's own space at the same length. A
-    // vertex recorded without wind has code 0 and is not touched.
+    // vertex recorded without wind has code 0 and is not touched, and nor does a wobble code (32768 and
+    // up, #216 W), which is faded above rather than bent.
     static_assert(STATIC_BAKE_WIND_LINES == 127, "the bend below splits 180 degrees into 127 lines");
     std::string posCode = "float3 bakePos = position.xyz;\n"
                           "    float bakeCode = floor(position.w * 0.25);\n"
-                          "    if (bakeCode > 0.0) {\n"
+                          "    if (bakeCode > 0.0 && bakeCode < 32768.0) {\n"
                           "        float bakeDir = floor(bakeCode * (1.0 / 256.0));\n"
                           "        float bakeWt = (bakeCode - bakeDir * 256.0) * (1.0 / 255.0);\n"
                           "        float3 bakeBend = uWindB.xyz;\n"
@@ -1198,7 +1231,8 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
                      shadeMask, cc_features.numInputs, base->shader_id0, base->shader_id1);
         return nullptr;
     }
-    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0])) {
+    if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0],
+                               cc_features.opt_alpha, cc_features.numInputs)) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");

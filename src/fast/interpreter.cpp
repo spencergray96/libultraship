@@ -1785,6 +1785,10 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     const bool windBend = windDecode && !gStaticBakeRecording;
     bool windReady = false;
     uint32_t windVertices = 0;
+    // The wobble (sturdy-bassoon#216 W), the same guard: a record pass notes each wobble vertex's code for
+    // the replay shader; anything drawn here takes its factor now, for GfxSpTri1 to fade its alpha inputs.
+    const bool wobbleDecode = archiveFlags && (gStaticBakeRecording || gStaticBakeWobbleOn);
+    uint32_t wobbleVertices = 0;
 #endif
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
@@ -1797,7 +1801,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         float ob[3] = { (float)v->ob[0], (float)v->ob[1], (float)v->ob[2] };
         d->windCode = 0;
+        d->wobbleCode = 0;
+        d->wobble = 1.0f;
 #ifdef ENABLE_STATIC_BAKE
+        if (wobbleDecode) {
+            // StaticBakeWobbleCode is 0 for any flag with bit 15 set, so a wind vertex never wobbles.
+            const uint16_t code = StaticBakeWobbleCode(v->flag);
+            if (code != 0) {
+                wobbleVertices++;
+                d->wobbleCode = code;
+                if (!gStaticBakeRecording) {
+                    d->wobble = StaticBakeWobbleFactor(code);
+                }
+            }
+        }
         if (windDecode) {
             const uint16_t code = StaticBakeWindCode(v->flag);
             if (code != 0) {
@@ -2021,6 +2038,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 #ifdef ENABLE_STATIC_BAKE
     if (windVertices != 0) {
         StaticBakeNoteWindVertices(windVertices);
+    }
+    if (wobbleVertices != 0) {
+        StaticBakeNoteWobbleVertices(wobbleVertices);
     }
 #endif
 }
@@ -2433,9 +2453,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mBufVbo[mBufVboLen++] = z;
         // And the wind (#209 W1): a weighted vertex's code rides on top, w + 4 x code, for the replay
         // shader to bend it. Every other vertex records exactly the w it did before wind existed.
+        // The wobble (#216 W) rides the same way with its own codes, above every wind code; a vertex
+        // carries one or the other (StaticBakeWobbleCode refuses a flag with wind's bit).
         if (bakeRecording && !is_rect && v_arr[i]->windCode != 0) {
             mBufVbo[mBufVboLen++] =
                 (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)v_arr[i]->windCode;
+        } else if (bakeRecording && !is_rect && v_arr[i]->wobbleCode != 0) {
+            mBufVbo[mBufVboLen++] =
+                (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)v_arr[i]->wobbleCode;
         } else {
             mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
         }
@@ -2604,13 +2629,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     mBufVbo[mBufVboLen++] = color->g / 255.0f;
                     mBufVbo[mBufVboLen++] = color->b / 255.0f;
                 } else {
+                    float alphaOut;
                     if (use_fog && !use_blend_color && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for standard fog, blend color mode preserves
                         // it since fog alpha is the blend factor
-                        mBufVbo[mBufVboLen++] = 1.0f;
+                        alphaOut = 1.0f;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        alphaOut = color->a / 255.0f;
                     }
+                    // The wobble (#216 W): every alpha input of a wobble vertex fades by its factor now,
+                    // as the replay shader multiplies result.inputN.a. A record pass keeps it as it is.
+                    if (!bakeRecording && !is_rect && v_arr[i]->wobbleCode != 0) {
+                        alphaOut *= v_arr[i]->wobble;
+                    }
+                    mBufVbo[mBufVboLen++] = alphaOut;
                 }
             }
         }
