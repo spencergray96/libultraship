@@ -237,9 +237,9 @@ struct LoadedVertex {
     uint16_t windCode;
     // Wobble in the replay (sturdy-bassoon#216 W): the wobble code (StaticBakeWobbleCode), 0 for a vertex
     // that does not wobble or while nothing decodes it. A record pass carries it into the recording's w;
-    // anything drawn now multiplies every alpha input by `wobble`, the factor GfxSpVertex worked out.
+    // anything drawn now multiplies every alpha input by `wobbleFactor`, which GfxSpVertex worked out.
     uint16_t wobbleCode;
-    float wobble;
+    float wobbleFactor;
 };
 
 struct RawTexMetadata {

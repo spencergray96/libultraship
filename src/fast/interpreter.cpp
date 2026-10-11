@@ -1802,7 +1802,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         float ob[3] = { (float)v->ob[0], (float)v->ob[1], (float)v->ob[2] };
         d->windCode = 0;
         d->wobbleCode = 0;
-        d->wobble = 1.0f;
+        d->wobbleFactor = 1.0f;
 #ifdef ENABLE_STATIC_BAKE
         if (wobbleDecode) {
             // StaticBakeWobbleCode is 0 for any flag with bit 15 set, so a wind vertex never wobbles.
@@ -1811,7 +1811,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 wobbleVertices++;
                 d->wobbleCode = code;
                 if (!gStaticBakeRecording) {
-                    d->wobble = StaticBakeWobbleFactor(code);
+                    d->wobbleFactor = StaticBakeWobbleFactor(code);
                 }
             }
         }
@@ -2455,12 +2455,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // shader to bend it. Every other vertex records exactly the w it did before wind existed.
         // The wobble (#216 W) rides the same way with its own codes, above every wind code; a vertex
         // carries one or the other (StaticBakeWobbleCode refuses a flag with wind's bit).
-        if (bakeRecording && !is_rect && v_arr[i]->windCode != 0) {
-            mBufVbo[mBufVboLen++] =
-                (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)v_arr[i]->windCode;
-        } else if (bakeRecording && !is_rect && v_arr[i]->wobbleCode != 0) {
-            mBufVbo[mBufVboLen++] =
-                (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)v_arr[i]->wobbleCode;
+        const uint16_t wCode = v_arr[i]->windCode != 0 ? v_arr[i]->windCode : v_arr[i]->wobbleCode;
+        if (bakeRecording && !is_rect && wCode != 0) {
+            mBufVbo[mBufVboLen++] = (bakeLit ? STATIC_BAKE_LIT_W : w) + STATIC_BAKE_WIND_W_SCALE * (float)wCode;
         } else {
             mBufVbo[mBufVboLen++] = bakeLit ? STATIC_BAKE_LIT_W : w;
         }
@@ -2640,7 +2637,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     // The wobble (#216 W): every alpha input of a wobble vertex fades by its factor now,
                     // as the replay shader multiplies result.inputN.a. A record pass keeps it as it is.
                     if (!bakeRecording && !is_rect && v_arr[i]->wobbleCode != 0) {
-                        alphaOut *= v_arr[i]->wobble;
+                        alphaOut *= v_arr[i]->wobbleFactor;
                     }
                     mBufVbo[mBufVboLen++] = alphaOut;
                 }

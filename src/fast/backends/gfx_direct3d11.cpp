@@ -1079,15 +1079,20 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "    float4 uWindB;\n"    // bend at weight 1 along the wind (xyz), ripple (w); #209 W1
           "    float4 uWobble;\n"   // cycle now (x), strength (y); #216 W
           "};\n\n";
-    // The wobble's factor for a recorded w (#216 W; StaticBakeWobbleFactor is the interpreter's mirror, in
-    // the same order): 1 for a code below STATIC_BAKE_WOBBLE_W_CODE_BASE, wind's or none; otherwise
-    // 1 - strength x (1 - cos(2 pi (cycle + phase / 256))) / 2. A list without wobble vertices has
-    // uWobble at 0, so the factor is 1 there too.
-    static_assert(STATIC_BAKE_WOBBLE_W_CODE_BASE == 32768, "the shader below splits wind and wobble codes at 32768");
-    cb += "float StaticBakeWobble(float w) {\n"
+    // The wobble's factor for a recorded w (#216 W), named after its mirror, the interpreter's
+    // StaticBakeWobbleFactor, and computed in the same order: 1 for a code below
+    // STATIC_BAKE_WOBBLE_W_CODE_BASE, wind's or none; otherwise 1 - strength x (1 - cos(2 pi (cycle +
+    // phase / 256))) / 2. A list without wobble vertices has uWobble at 0, so the factor is 1 there too.
+    // The bend below splits wind's codes from the wobble's at the same value.
+    const std::string wobbleFrom = std::to_string(STATIC_BAKE_WOBBLE_W_CODE_BASE) + ".0";
+    cb += "float StaticBakeWobbleFactor(float w) {\n"
           "    float code = floor(w * 0.25);\n"
-          "    if (code < 32768.0) { return 1.0; }\n"
-          "    float p = (code - 32768.0) * (1.0 / 256.0);\n"
+          "    if (code < " +
+          wobbleFrom +
+          ") { return 1.0; }\n"
+          "    float p = (code - " +
+          wobbleFrom +
+          ") * (1.0 / 256.0);\n"
           "    return 1.0 - uWobble.y * 0.5 * (1.0 - cos(6.28318531 * (uWobble.x + p)));\n"
           "}\n\n";
 
@@ -1113,6 +1118,13 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     }
     src.insert(vsAt, cb);
 
+    // Where colour input j's pass-through line ends (its `;`), within VSMain rather than PSMain, or npos when
+    // the program has no such line. The lighting and the wobble each insert right after it.
+    const auto passThroughEnd = [&](int j) {
+        const size_t at = src.find("result.input" + std::to_string(j + 1) + " = ", vsAt + cb.size());
+        return at == std::string::npos ? std::string::npos : src.find(';', at);
+    };
+
     // Each SHADE input's pass-through line is `result.inputN = inputN;`, or
     // `result.inputN = float4(inputN, 1.0);` without alpha. Light it right after, from what it just
     // copied: for a lit vertex that is the normal in .rgb, with the vertex's own alpha untouched.
@@ -1125,8 +1137,7 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
             continue;
         }
         const std::string name = "result.input" + std::to_string(j + 1);
-        const size_t at = src.find(name + " = ", vsAt + cb.size()); // within VSMain, not PSMain
-        const size_t end = at == std::string::npos ? std::string::npos : src.find(';', at);
+        const size_t end = passThroughEnd(j);
         if (end == std::string::npos) {
             return false;
         }
@@ -1136,17 +1147,16 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
 
     // The wobble (#216 W): each alpha input's pass-through line, `result.inputN = inputN;` in a program with
     // alpha, gains a fade by the vertex's factor right after, as GfxSpTri1 multiplies the same value. Every
-    // input, as the interpreter does, so prim alpha fades (the import's translucent material reads it) and
-    // fog's own slot and its forced shade alpha are left as they are.
+    // input, as the interpreter does: prim alpha fades (the import's translucent material reads it), and so
+    // does the 1 a fogged material's shade alpha is forced to. The fog factor and its slot are untouched.
     if (hasAlpha) {
         for (int j = 0; j < numInputs; j++) {
             const std::string name = "result.input" + std::to_string(j + 1);
-            const size_t at = src.find(name + " = ", vsAt + cb.size()); // within VSMain, not PSMain
-            const size_t end = at == std::string::npos ? std::string::npos : src.find(';', at);
+            const size_t end = passThroughEnd(j);
             if (end == std::string::npos) {
                 return false;
             }
-            src.insert(end + 1, "\n    " + name + ".a *= StaticBakeWobble(position.w);");
+            src.insert(end + 1, "\n    " + name + ".a *= StaticBakeWobbleFactor(position.w);");
         }
     }
 
@@ -1169,7 +1179,9 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     static_assert(STATIC_BAKE_WIND_LINES == 127, "the bend below splits 180 degrees into 127 lines");
     std::string posCode = "float3 bakePos = position.xyz;\n"
                           "    float bakeCode = floor(position.w * 0.25);\n"
-                          "    if (bakeCode > 0.0 && bakeCode < 32768.0) {\n"
+                          "    if (bakeCode > 0.0 && bakeCode < " +
+                          wobbleFrom +
+                          ") {\n"
                           "        float bakeDir = floor(bakeCode * (1.0 / 256.0));\n"
                           "        float bakeWt = (bakeCode - bakeDir * 256.0) * (1.0 / 255.0);\n"
                           "        float3 bakeBend = uWindB.xyz;\n"

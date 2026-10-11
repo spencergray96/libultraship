@@ -319,8 +319,8 @@ StaticBakeWindStats StaticBakeGetWindStats();
 // pass-through, and the interpreter multiplies the same value as it writes it. Exact for a combiner whose
 // alpha is one input (`PRIMITIVE`, what the import writes); a combiner that mixes several alpha inputs
 // fades by a different curve, but baked and interpreted still agree. A material without alpha (opaque, no
-// blend) has no alpha inputs, so a wobble vertex in it draws as recorded. The fog factor, its slot and
-// shade alpha's own handling are not touched.
+// blend) has no alpha inputs, so a wobble vertex in it draws as recorded. The fog factor and its slot are not
+// touched; a fogged material that reads shade alpha (forced to 1 under fog) fades too, where it wobbles.
 //
 // THE CARRIER is Vtx_t.flag, in the half of its space wind leaves free (bit 15 clear; see
 // STATIC_BAKE_WOBBLE_FLAG_*), read from an archive vertex's XML `Flag`. A flag is wind or wobble, never
@@ -391,7 +391,8 @@ std::vector<StaticBakeKeyedEntry> StaticBakeGetWobbleEntries();
 // What the wobble did in the last whole frame drawn:
 //   replayEntries   baked list entries replayed with the wobble on (a list holding wobble vertices while
 //                   the strength is non-zero)
-//   interpVertices  wobble vertices the interpreter faded (none of them baked)
+//   interpVertices  wobble vertices the interpreter loaded with the wobble on (none of them baked); those
+//                   in a material without alpha are counted but have nothing to fade
 struct StaticBakeWobbleStats {
     uint32_t replayEntries = 0;
     uint32_t interpVertices = 0;
