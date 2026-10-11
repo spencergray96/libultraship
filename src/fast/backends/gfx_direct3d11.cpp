@@ -1014,7 +1014,8 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 // What the patched vertex stage does that the original did not:
 //   * multiplies the (now object-space) position by the camera, and applies the DX11 0..1 depth
 //     remap that GfxSpTri1 used to do per vertex on the CPU;
-//   * recomputes the fog factor from the *unremapped* clip z/w with the same clamp and the same
+//   * recomputes the fog factor from the *unremapped* clip z/w (or, in world-unit fog, from clip w
+//     alone, sturdy-bassoon#167) with the same clamp and the same
 //     division-by-zero guard as GfxSpVertex, and takes the fog colour from the uniform - the
 //     recorded fog bytes are dead weight (the record pass saw an identity matrix), which is why
 //     fog changes need no rebake;
@@ -1069,7 +1070,10 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           maxLights +
           "];\n"
           "    float4 uLightColor[" +
-          maxLights + "];\n};\n\n";
+          maxLights +
+          "];\n"
+          "    float4 uFogWorld;\n" // sturdy-bassoon#167: x mul, y offset (over clip w), z 1 = world mode
+          "};\n\n";
     // StaticBakeAnimUniforms, member for member: four float4 registers.
     cb += "cbuffer StaticBakeAnimCB : register(b";
     cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT);
@@ -1201,12 +1205,14 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     if (hasFog) {
         // Mirrors GfxSpVertex exactly, including the division-by-zero guard, the 0..255 clamp and
         // the floor: the interpreter stores the factor in a uint8_t colour channel, so the
-        // quantization is part of the picture, not an artefact of it.
+        // quantization is part of the picture, not an artefact of it. World-unit fog
+        // (sturdy-bassoon#167) is the same line over the guarded clip w, the view depth, as GfxSpVertex's.
         std::string fogCode = "float bakeW = abs(bakeClip.w) < 0.001 ? 0.001 : bakeClip.w;\n"
                               "        float bakeWinv = 1.0 / bakeW;\n"
                               "        if (bakeWinv < 0.0) { bakeWinv = 32767.0; }\n"
-                              "        float bakeFog = floor(clamp(bakeClip.z * bakeWinv * uFogParams.x + "
-                              "uFogParams.y, 0.0, 255.0)) / 255.0;\n"
+                              "        float bakeFogIn = uFogWorld.z > 0.5 ? bakeW * uFogWorld.x + uFogWorld.y\n"
+                              "            : bakeClip.z * bakeWinv * uFogParams.x + uFogParams.y;\n"
+                              "        float bakeFog = floor(clamp(bakeFogIn, 0.0, 255.0)) / 255.0;\n"
                               "        result.fog = float4(uFogColor.rgb, bakeFog);";
         const size_t fogAt = src.find(kFogMarker);
         src.replace(fogAt, strlen(kFogMarker), fogCode);

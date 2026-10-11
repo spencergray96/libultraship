@@ -68,6 +68,10 @@ struct StaticBakeUniforms {
     float ambient[4];
     float lightDir[STATIC_BAKE_MAX_DIR_LIGHTS][4];
     float lightColor[STATIC_BAKE_MAX_DIR_LIGHTS][4];
+    // World-unit fog (sturdy-bassoon#167), from the RSP state G_FOG_WORLD left: x fog_world_mul, y
+    // fog_world_offset (the factor is clip w * x + y, 0..255), z 1 in world mode and 0 for vanilla, w 0.
+    // Boundary fog's uniforms (sturdy-bassoon#169 stage 2) go after this one.
+    float fogWorld[4];
 };
 
 // What moves in a baked draw: the second constant buffer on the replay's vertex stage

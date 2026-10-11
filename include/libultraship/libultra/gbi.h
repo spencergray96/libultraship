@@ -197,6 +197,7 @@
 #define G_SETTILESIZE_INTERP 0x45
 #define G_SETTARGETINTERPINDEX 0x46
 #define G_SETTILESIZE_LERP 0x4a
+#define G_FOG_WORLD 0x4b
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2651,6 +2652,24 @@ typedef union Gfx {
 #define gsSPFogPosition(min, max) \
     gsMoveWd(G_MW_FOG, G_MWO_FOG, \
              (_SHIFTL((128000 / ((max) - (min))), 16, 16) | _SHIFTL(((500 - (min)) * 256 / ((max) - (min))), 0, 16)))
+
+/*
+ * World-unit fog (sturdy-bassoon#167): fog linear in view depth, clear out to `start` and complete at
+ * `end`, both in world units (0..65535, start < end). Unlike the two forms above it is not a moveword:
+ * it switches the RSP into world-fog mode, and the next G_MW_FOG moveword (gSPFogPosition, gSPFogFactor)
+ * switches it back, so whichever fog command came last is the one in force. The low 24 bits of w0 are
+ * reserved and must be 0.
+ */
+#define gSPFogWorld(pkt, start, end)                                          \
+    {                                                                         \
+        Gfx* _g = (Gfx*)(pkt);                                                \
+                                                                              \
+        _g->words.w0 = _SHIFTL(G_FOG_WORLD, 24, 8);                           \
+        _g->words.w1 = (_SHIFTL((start), 16, 16) | _SHIFTL((end), 0, 16));    \
+    }
+
+#define gsSPFogWorld(start, end) \
+    { (_SHIFTL(G_FOG_WORLD, 24, 8)), (_SHIFTL((start), 16, 16) | _SHIFTL((end), 0, 16)) }
 
 #ifdef F3DEX_GBI_2
 /*

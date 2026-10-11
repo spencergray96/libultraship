@@ -277,6 +277,13 @@ struct RSP {
     } texture_scaling_factor;
 
     struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
+
+    // World-unit fog (sturdy-bassoon#167). G_FOG_WORLD sets fog_world and its band, as the factor's 0..255
+    // line over view depth: fog = w * fog_world_mul + fog_world_offset. A G_MW_FOG moveword clears it, so
+    // the last fog command in the stream is the one in force; fog_mul/fog_offset keep the vanilla band.
+    bool fog_world;
+    float fog_world_mul;
+    float fog_world_offset;
 };
 
 struct RDP {

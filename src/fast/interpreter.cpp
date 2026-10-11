@@ -2028,7 +2028,13 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            // The fog factor, 0..255: world-unit fog is linear in view depth, which is clip w under OoT's
+            // perspective (sturdy-bassoon#167); vanilla is linear in post-divide z. The bake's patched
+            // vertex shader computes the same line (gfx_direct3d11.cpp, StaticBakePatchSource). A vertex behind
+            // the camera (w < 0) gets no world fog, where vanilla's winv quirk fogs it fully; clipping at the
+            // near plane interpolates the world factor exactly, since it is linear in clip-space w.
+            float fog_z = mRsp->fog_world ? w * mRsp->fog_world_mul + mRsp->fog_world_offset
+                                          : z * winv * mRsp->fog_mul + mRsp->fog_offset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
@@ -2766,6 +2772,7 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
             mRsp->fog_offset = (int16_t)data;
+            mRsp->fog_world = false; // a vanilla fog command ends world-unit fog (sturdy-bassoon#167)
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
@@ -2792,6 +2799,7 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
             mRsp->fog_offset = (int16_t)data;
+            mRsp->fog_world = false; // a vanilla fog command ends world-unit fog (sturdy-bassoon#167)
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
@@ -3689,6 +3697,7 @@ bool gfx_load_ucode_handler_f3dex2(F3DGfx** cmd) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mRsp->fog_mul = 0;
     gfx->mRsp->fog_offset = 0;
+    gfx->mRsp->fog_world = false;
     return false;
 }
 
@@ -4916,6 +4925,24 @@ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G_FOG_WORLD (sturdy-bassoon#167; gbi.h gSPFogWorld): w1 = start << 16 | end, view depths in world units.
+// Enters world-unit fog until the next G_MW_FOG moveword. The band is kept as the factor's own line, so
+// GfxSpVertex and the bake's replay uniforms each compute it with one multiply-add.
+bool gfx_fog_world_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    const float start = (float)C1(16, 16);
+    float end = (float)C1(0, 16);
+    if (end <= start) {
+        end = start + 1.0f; // the macro's contract is start < end; never divide by zero on a bad one
+    }
+    gfx->mRsp->fog_world = true;
+    gfx->mRsp->fog_world_mul = 255.0f / (end - start);
+    gfx->mRsp->fog_world_offset = -start * gfx->mRsp->fog_world_mul;
+    return false;
+}
+
 bool gfx_set_combine_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -5197,6 +5224,7 @@ static constexpr UcodeHandler otrHandlers = {
     { RDP_G_LOADBLOCK_WIDE, { "G_LOADBLOCK_WIDE", gfx_load_block_wide_handler_rdp } }, // RDP_G_LOADBLOCK_WIDE (-15)
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
+    { OTR_G_FOG_WORLD, { "G_FOG_WORLD", gfx_fog_world_handler_custom } },              // G_FOG_WORLD (0x4b)
 };
 
 static constexpr UcodeHandler f3dex2Handlers = {
@@ -5326,6 +5354,7 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
         case ucode_f3dex2:
             gfx->mRsp->fog_mul = 0;
             gfx->mRsp->fog_offset = 0;
+            gfx->mRsp->fog_world = false;
             break;
         default:
             break;

@@ -217,6 +217,11 @@ void WobbleCycleNow() {
 // after them import and bind the texture exactly as a live frame would, which is what the capture
 // then holds. They are exactly what our scenes emit (sturdy-bassoon#142 step 0): gsDPLoadTextureBlock
 // is FD F5 E6 F3 E7 F5 F2, and Fast64's CI4 material adds F0.
+//
+// No fog command is on it, on purpose: neither G_MOVEWORD (0xdb, which carries gSPFogPosition) nor
+// G_FOG_WORLD (0x4b, sturdy-bassoon#167). The replay reads the fog band from the RSP state at the parent
+// G_DL, and Play_SetFog emits it into the parent OPA/XLU stream, never into a room list, so a list that
+// carries its own fog command could not be replayed faithfully. It is refused and stays interpreted.
 bool sOpcodeAllowed[256] = {};
 bool sOpcodeTableBuilt = false;
 
@@ -393,6 +398,11 @@ void Replay(Interpreter* gfx, Entry& e) {
     u.fogColor[3] = 1.0f;
     u.fogMul = (float)gfx->mRsp->fog_mul;
     u.fogOffset = (float)gfx->mRsp->fog_offset;
+    // World-unit fog (sturdy-bassoon#167): read here, at the parent G_DL, like the vanilla band above.
+    u.fogWorld[0] = gfx->mRsp->fog_world_mul;
+    u.fogWorld[1] = gfx->mRsp->fog_world_offset;
+    u.fogWorld[2] = gfx->mRsp->fog_world ? 1.0f : 0.0f;
+    u.fogWorld[3] = 0.0f;
 
     // The lights, as GfxSpVertex would read them for this display list: the last one is the
     // ambient, and each directional light's direction goes through CalculateNormalDir under the
