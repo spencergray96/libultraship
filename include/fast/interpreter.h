@@ -424,6 +424,17 @@ class Interpreter {
                           uint8_t resize, bool forceFixedAspect = false);
     void SetFrameBuffer(int fb, float noiseScale);
     void CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr);
+    // Sky-colour fog (sturdy-bassoon#226; SkyFogSet below). A copy into the framebuffer SkyFogSet names arms it for
+    // the rest of the rendered frame; Run disarms it at both ends, and it is held off while an off-screen framebuffer
+    // (G_SETFB) is the target, whose pixels are not the screen's. UpdateSkyFog tells the backend on a change.
+    void ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int width, int height);
+    void HandOverSkyFog();
+    void UpdateSkyFog();
+    void DumpSkyFog();
+    bool mSkyFogArmed = false;
+    bool mSkyFogBound = false;
+    int mSkyFogSrcFb = 0;
+    SkyFogParams mSkyFogParams;
     void ResetFrameBuffer();
     void AdjustPixelDepthCoordinates(float& x, float& y);
     void GetPixelDepthPrepare(float x, float y);
@@ -640,6 +651,37 @@ const FogBoundary& FogBoundaryNow();
 // The distance past the boundary at world (x, z): what GfxSpVertex ramps, and what `fog edge status` reports.
 // 0 inside; with no rectangles, 0.
 float FogBoundaryDistance(const FogBoundary& boundary, float x, float z);
+
+// Sky-colour fog (sturdy-bassoon#226): fogged pixels blend toward the sky behind them instead of toward the fog
+// colour. The sky is a copy of the frame taken just before the rooms draw - a G_COPYFB into framebuffer fb, which
+// Play_Draw emits only while it is on - and the pixel shader reads it at its own screen position (DX11 only;
+// gfx_rendering_api.h SKY_FOG_*). Only the colour changes: the fog factor, shade alpha and every vertex path are
+// untouched. Set by the game when the console changes it (WorldFog_SetSky); mode SKY_FOG_OFF or fb < 0 switches it
+// off.
+void SkyFogSet(int fb, uint32_t mode);
+struct SkyFogStatus {
+    int fb = -1;
+    uint32_t mode = 0;      // SKY_FOG_*
+    uint64_t runs = 0;      // rendered frames (Interpreter::Run calls)
+    uint64_t copies = 0;    // copies into fb that armed it
+    uint64_t lastCopyRun = 0;
+    SkyFogParams last;      // what the last copy armed: size, origin, horizon line
+    uint32_t msaa = 1;
+    uint64_t dumps = 0;     // `fog sky dump` requests written
+    bool hold = false;      // SkyFogHold
+    bool holding = false;   // hold has a copy of its own: the first copy since it went on was taken
+    bool lastDumpOk = false;
+    bool dumpPending = false;
+};
+const SkyFogStatus& SkyFogNow();
+// `fog sky dump` (a debug readback): at the end of the next rendered frame that armed sky fog, write the copy and the
+// finished game image (before ImGui), same frame, 8 bits, as <prefix>-copy.ppm and <prefix>-frame.ppm.
+void SkyFogRequestDump(const std::string& prefix);
+// `fog sky hold` (a measurement aid): while on, a copy into the sky framebuffer after the first is skipped and the
+// frame arms with the copy it already has, so captures a moment apart fog toward the same sky (the sky itself drifts).
+// Switching it on always takes one fresh copy first, so it never holds one from another scene or window size.
+// The horizon line is the held copy's too: for a camera that does not move.
+void SkyFogHold(bool hold);
 
 } // namespace Fast
 

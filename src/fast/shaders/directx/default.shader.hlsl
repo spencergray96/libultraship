@@ -66,7 +66,31 @@ float4 grayscale : GRAYSCALE;
 cbuffer PerFrameCB : register(b0) {
     uint noise_frame;
     float noise_scale;
+    // Sky-colour fog (sturdy-bassoon#226), appended. PerFrameCB in gfx_direct3d_common.h has the same layout, and
+    // gfx_rendering_api.h the constants hard-coded below: SKY_FOG_TEXTURE_SLOT, SKY_FOG_CLAMP and
+    // SKY_FOG_HORIZON_EPSILON.
+    uint2 per_frame_pad;
+    int2 sky_origin;     // the render-target pixel the copy's texel (0, 0) came from
+    int2 sky_size;       // the copy's size in texels
+    float4 sky_horizon;  // a, b, c: a x + b y + c > 0 above the horizon, over render-target pixels
+    uint sky_fog_mode;   // 0 off, 1 mirror, 2 clamp
 }
+
+@if(o_fog)
+Texture2D g_skyCopy : register(t6);
+
+// Sky-colour fog (sturdy-bassoon#226): the sky copy's colour under render-target pixel pos - the frame as it was
+// just before the rooms drew. Mirror reads it as it is; clamp reads a pixel below the horizon from two pixels above
+// the horizon in the same column, so fogged ground takes the horizon's colour, not the skybox's mirrored sky.
+float3 SkyFogColor(float2 pos) {
+    float2 p = pos;
+    if (sky_fog_mode == 2 && dot(sky_horizon.xyz, float3(pos, 1.0)) < 0.0 && abs(sky_horizon.y) > 1e-6) {
+        p.y = -(sky_horizon.x * pos.x + sky_horizon.z) / sky_horizon.y + 2.0 * sign(sky_horizon.y);
+    }
+    int2 t = clamp(int2(floor(p)) - sky_origin, int2(0, 0), sky_size - int2(1, 1));
+    return g_skyCopy.Load(int3(t, 0)).rgb;
+}
+@end
 
 float random(in float3 value) {
     float random = dot(value, float3(12.9898, 78.233, 37.719));
@@ -384,10 +408,15 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
     @if(o_fog)
+        // The fog factor (input.fog.a) is untouched by sky fog; only the colour it blends toward changes.
+        float3 fogRgb = input.fog.rgb;
+        if (sky_fog_mode != 0) {
+            fogRgb = SkyFogColor(screenSpace.xy);
+        }
         @if(o_alpha)
-            texel = float4(lerp(texel.rgb, input.fog.rgb, input.fog.a), texel.a);
+            texel = float4(lerp(texel.rgb, fogRgb, input.fog.a), texel.a);
         @else
-            texel = lerp(texel, input.fog.rgb, input.fog.a);
+            texel = lerp(texel, fogRgb, input.fog.a);
         @end
     @end
 

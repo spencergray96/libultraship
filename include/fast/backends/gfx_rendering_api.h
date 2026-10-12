@@ -4,6 +4,7 @@
 
 #include <unordered_map>
 #include <set>
+#include <vector>
 #include "imconfig.h"
 
 namespace Fast {
@@ -37,6 +38,28 @@ constexpr int STATIC_BAKE_MAX_DIR_LIGHTS = 7;
 // drawn with, in the interpreter and in the replay shader's cbuffer alike. F2P's 6 x 6 needs 1. The game's
 // WorldFog.h and the grid tool's sceneTemplate.ts mirror it; past it the export writes the area's bounding box.
 constexpr uint32_t FOG_BOUNDARY_MAX_RECTS = 8;
+
+// Sky-colour fog (sturdy-bassoon#226; interpreter.h SkyFogSet): fogged pixels blend toward the sky copy's texel
+// under them instead of the fog colour. Mirror reads the copy as it is, the skybox's mirror below the horizon
+// included; clamp reads a pixel below the horizon from just above it, in the same column.
+constexpr uint32_t SKY_FOG_OFF = 0;
+constexpr uint32_t SKY_FOG_MIRROR = 1;
+constexpr uint32_t SKY_FOG_CLAMP = 2;
+// The pixel shader's slot for the copy: t0-t1 are the combiner's textures, t2-t3 masks, t4-t5 blends. The HLSL
+// template (default.shader.hlsl) hard-codes it and SKY_FOG_CLAMP's 2, beside a comment pointing here.
+constexpr uint32_t SKY_FOG_TEXTURE_SLOT = 6;
+// Below this |b| the horizon line is near vertical (the camera rolled a quarter turn) and clamp leaves the pixel
+// alone. default.shader.hlsl's SkyFogColor uses the same value.
+constexpr float SKY_FOG_HORIZON_EPSILON = 1e-6f;
+
+// What the pixel shader needs to read the copy, from the interpreter at the copy (Interpreter::CopyFrameBuffer).
+struct SkyFogParams {
+    uint32_t mode = SKY_FOG_OFF;
+    int fbId = -1;              // the framebuffer holding the copy
+    int32_t origin[2] = {};     // the render-target pixel the copy's texel (0, 0) came from
+    int32_t size[2] = {};       // the copy's size in texels
+    float horizon[3] = {};      // a, b, c over render-target pixels (x right, y down): a x + b y + c > 0 above it
+};
 
 // A recorded vertex that was lit under G_LIGHTING carries its raw object-space normal where its
 // lit colour would have gone, and this value in position.w to say so. Recorded w is otherwise
@@ -248,6 +271,17 @@ class GfxRenderingAPI {
     // How the shader picks a mipmapped texture's level: fast/TextureMips.h TextureMipsLodMode, and a
     // bias added to it. Takes effect from the next draw.
     virtual void SetMipLod(int mode, float bias) {
+    }
+
+    // ---- Sky-colour fog (sturdy-bassoon#226). ----
+    // Arms (mode != SKY_FOG_OFF) or disarms the sky copy for the pixel shader's fog colour, from the next draw.
+    // The interpreter calls it only on a change. A backend that ignores it, every one but DX11, fogs as before.
+    virtual void SetSkyFog(const SkyFogParams& params) {
+    }
+    // Reads a framebuffer's pixels as 8-bit RGBA (a debug readback for `fog sky dump`, sturdy-bassoon#226): the
+    // rectangle x, y (top-left origin) by w x h, resolving MSAA first. False where unsupported or out of bounds.
+    virtual bool ReadFramebufferRGBA8(int fbId, int x, int y, int w, int h, std::vector<uint8_t>& out) {
+        return false;
     }
     // Uploads that really built more than one level: a texture that is not a power of two gets one
     // level even when asked, and so does every texture on a backend that ignores the request.

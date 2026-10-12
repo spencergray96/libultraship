@@ -1852,6 +1852,105 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
     mContext->Unmap(mReadbackStaging.Get(), 0);
 }
 
+// Sky-colour fog (sturdy-bassoon#226): the copy goes on its own pixel-shader slot, which nothing else binds, and
+// its parameters into PerFrameCB (b0, bound for every pixel shader, the bake's replay included). Off unbinds it, so
+// the copy's texture is never left bound into the next frame.
+void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
+    ID3D11ShaderResourceView* view = nullptr;
+    if (params.mode != SKY_FOG_OFF && params.fbId >= 0 && params.fbId < (int)mFrameBuffers.size()) {
+        view = mTextures[mFrameBuffers[params.fbId].texture_id].resource_view.Get();
+    }
+    mContext->PSSetShaderResources(SKY_FOG_TEXTURE_SLOT, 1, &view);
+
+    mPerFrameCbData.sky_fog_mode = view != nullptr ? params.mode : SKY_FOG_OFF;
+    for (int i = 0; i < 2; i++) {
+        mPerFrameCbData.sky_origin[i] = params.origin[i];
+        mPerFrameCbData.sky_size[i] = params.size[i];
+    }
+    for (int i = 0; i < 3; i++) {
+        mPerFrameCbData.sky_horizon[i] = params.horizon[i];
+    }
+    mPerFrameCbData.sky_horizon[3] = 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+    mContext->Map(mPerFrameCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    memcpy(ms.pData, &mPerFrameCbData, sizeof(PerFrameCB));
+    mContext->Unmap(mPerFrameCb.Get(), 0);
+}
+
+// `fog sky dump`'s readback (sturdy-bassoon#226): full 8 bits, unlike ReadFramebufferToCPU's RGBA16. A debug path
+// taken once per request, so it makes its own textures rather than caching them.
+bool GfxRenderingAPIDX11::ReadFramebufferRGBA8(int fbId, int x, int y, int w, int h, std::vector<uint8_t>& out) {
+    if (fbId < 0 || fbId >= (int)mFrameBuffers.size() || w <= 0 || h <= 0) {
+        return false;
+    }
+    FramebufferDX11& fb = mFrameBuffers[fbId];
+    ID3D11Texture2D* src = mTextures[fb.texture_id].texture.Get();
+    if (src == nullptr) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC srcDesc;
+    src->GetDesc(&srcDesc);
+    if (x < 0 || y < 0 || x + w > (int)srcDesc.Width || y + h > (int)srcDesc.Height) {
+        return false;
+    }
+    if (srcDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM && srcDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = srcDesc.Width;
+    desc.Height = srcDesc.Height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = srcDesc.Format;
+    desc.SampleDesc.Count = 1;
+
+    // A multisampled target is resolved first, as CopyFramebuffer does.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved;
+    if (srcDesc.SampleDesc.Count > 1) {
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, resolved.GetAddressOf()))) {
+            return false;
+        }
+        mContext->ResolveSubresource(resolved.Get(), 0, src, 0, srcDesc.Format);
+        src = resolved.Get();
+    }
+
+    desc.Width = (UINT)w;
+    desc.Height = (UINT)h;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, staging.GetAddressOf()))) {
+        return false;
+    }
+    D3D11_BOX box = { (UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1 };
+    mContext->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, src, 0, &box);
+
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (FAILED(mContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map)) || map.pData == nullptr) {
+        return false;
+    }
+    const bool bgra = srcDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+    out.resize((size_t)w * h * 4);
+    for (int j = 0; j < h; j++) {
+        const uint8_t* row = (const uint8_t*)map.pData + (size_t)j * map.RowPitch;
+        uint8_t* dst = out.data() + (size_t)j * w * 4;
+        memcpy(dst, row, (size_t)w * 4);
+        if (bgra) {
+            for (int i = 0; i < w; i++) {
+                std::swap(dst[i * 4], dst[i * 4 + 2]);
+            }
+        }
+    }
+    mContext->Unmap(staging.Get(), 0);
+    return true;
+}
+
 void GfxRenderingAPIDX11::SetTextureFilter(FilteringMode mode) {
     mCurrentFilterMode = mode;
     gfx_texture_cache_clear();

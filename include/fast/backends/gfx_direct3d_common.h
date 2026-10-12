@@ -17,7 +17,16 @@ struct PerFrameCB {
     uint32_t noise_frame;
     float noise_scale;
     uint32_t padding[2]; // constant buffers must be multiples of 16 bytes in size
+    // Sky-colour fog (sturdy-bassoon#226; SkyFogParams), appended. The HLSL cbuffer in default.shader.hlsl has the
+    // same layout (padding is its per_frame_pad; sky_padding only rounds the size up): sky_origin and sky_size share
+    // one 16-byte register, sky_horizon has its own.
+    int32_t sky_origin[2] = {};
+    int32_t sky_size[2] = {};
+    float sky_horizon[4] = {}; // a, b, c, unused
+    uint32_t sky_fog_mode = 0; // SKY_FOG_OFF until the interpreter arms it
+    uint32_t sky_padding[3] = {};
 };
+static_assert(sizeof(PerFrameCB) == 64, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
 
 struct PerDrawCB {
     struct Texture {
@@ -144,6 +153,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
+    bool ReadFramebufferRGBA8(int fbId, int x, int y, int w, int h, std::vector<uint8_t>& out) override;
+    void SetSkyFog(const SkyFogParams& params) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;

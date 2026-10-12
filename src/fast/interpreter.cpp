@@ -1818,6 +1818,47 @@ float FogBoundaryDistance(const FogBoundary& boundary, float x, float z) {
     return best;
 }
 
+// Sky-colour fog (sturdy-bassoon#226; interpreter.h SkyFogSet). One copy, set by the game each frame; the copy's
+// G_COPYFB arms it in Interpreter::CopyFrameBuffer.
+static SkyFogStatus sSkyFog = {};
+static std::string sSkyFogDumpPrefix;
+
+void SkyFogSet(int fb, uint32_t mode) {
+    sSkyFog.fb = mode != SKY_FOG_OFF ? fb : -1;
+    sSkyFog.mode = fb >= 0 ? mode : SKY_FOG_OFF;
+}
+
+const SkyFogStatus& SkyFogNow() {
+    return sSkyFog;
+}
+
+void SkyFogHold(bool hold) {
+    sSkyFog.hold = hold;
+    sSkyFog.holding = false;
+}
+
+void SkyFogRequestDump(const std::string& prefix) {
+    sSkyFogDumpPrefix = prefix;
+    sSkyFog.dumpPending = !prefix.empty();
+}
+
+// A binary PPM (P6): RGB, 8 bits, no dependencies. rgba is w x h, top row first.
+static bool WriteSkyFogPpm(const std::string& path, const std::vector<uint8_t>& rgba, int w, int h) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::vector<uint8_t> rgb((size_t)w * h * 3);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        rgb[i * 3] = rgba[i * 4];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    const bool ok = fwrite(rgb.data(), 1, rgb.size(), f) == rgb.size();
+    return fclose(f) == 0 && ok;
+}
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices, bool archiveFlags) {
 #ifdef ENABLE_STATIC_BAKE
     // Wind in the replay (sturdy-bassoon#209 W1). Only an archive's vertices are decoded (the guard:
@@ -4670,6 +4711,7 @@ bool gfx_set_fb_handler_custom(F3DGfx** cmd0) {
         gfx->mFbActive = false;
         gfx->mActiveFrameBuffer = gfx->mFrameBuffers.end();
     }
+    gfx->UpdateSkyFog(); // held off while an off-screen framebuffer is the target (sturdy-bassoon#226)
     return false;
 }
 
@@ -4685,6 +4727,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
     gfx->mRdp->viewport_or_scissor_changed = true;
     gfx->mRenderingState.viewport = {};
     gfx->mRenderingState.scissor = {};
+    gfx->UpdateSkyFog(); // back on the game's target (sturdy-bassoon#226)
     return false;
 }
 
@@ -5714,6 +5757,10 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    // Sky-colour fog (sturdy-bassoon#226) starts every rendered frame disarmed: only this frame's copy arms it.
+    sSkyFog.runs++;
+    mSkyFogArmed = false;
+    UpdateSkyFog();
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(true, true);
     mRdp->viewport_or_scissor_changed = true;
@@ -5752,6 +5799,10 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 #endif
 
     Flush();
+    // Sky-colour fog (sturdy-bassoon#226): a pending dump reads this finished frame, then the copy is unbound.
+    DumpSkyFog();
+    mSkyFogArmed = false;
+    UpdateSkyFog();
     // The cache's occupancy as this frame leaves it: one read here instead of one at every insert,
     // erase and clear. A clear between frames (gfx_texture_cache_clear) shows at the next frame.
     gPerfCounters.texCacheSize = mTextureCache.map.size();
@@ -5826,6 +5877,13 @@ void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
 }
 
 void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
+    // Sky-colour fog's hold (sturdy-bassoon#226; SkyFogHold): keep the copy the sky framebuffer has, and arm with it.
+    if (sSkyFog.hold && sSkyFog.holding && sSkyFog.mode != SKY_FOG_OFF && fb_dst_id == sSkyFog.fb) {
+        mSkyFogParams.mode = sSkyFog.mode;
+        HandOverSkyFog();
+        return;
+    }
+
     // Do not copy again if we have already copied before
     if (copyOnce && hasCopiedPtr != nullptr && *hasCopiedPtr) {
         return;
@@ -5865,6 +5923,97 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
     if (hasCopiedPtr != nullptr) {
         *hasCopiedPtr = true;
     }
+
+    // Sky-colour fog (sturdy-bassoon#226): a copy into the sky framebuffer is the sky, and arms the fog colour.
+    if (sSkyFog.mode != SKY_FOG_OFF && fb_dst_id == sSkyFog.fb) {
+        ArmSkyFog(fb_dst_id, fb_src_id, srcX0, srcY0, dstX1 - dstX0, dstY1 - dstY0);
+    }
+}
+
+// The copy's texel (0, 0) is render-target pixel (srcX0, srcY0) - the game viewport's corner when the game draws
+// straight into the window - and the copy is the internal resolution, so texel = drawn pixel, 1:1.
+//
+// The horizon (clamp's): the vanishing line of horizontal directions, from the RSP's projection, which holds
+// projection x viewing (View_ApplyPerspective) as interpolated for this rendered frame. A direction d projects to
+// clip = d0 P[0] + d1 P[1] + d2 P[2] (GfxSpVertex's row-vector form, x widened as AdjXForAspectRatio does), so +X
+// and +Z vanish at the homogeneous screen points P[0] and P[2], and the line through them is their cross product.
+// Every horizontal direction scores 0 on it and any direction in front of the camera scores d1 times its score of
+// P[1], so it is flipped to make +Y (up) positive: then l . (x, y, 1) > 0 is above the horizon. The line is moved
+// from NDC to render-target pixels (x right, y down) through the viewport as the backend sets it (DX11 SetViewport:
+// top = target height - y - height).
+void Interpreter::ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int width, int height) {
+    SkyFogParams params;
+    params.mode = sSkyFog.mode;
+    params.fbId = fb_dst_id;
+    params.origin[0] = srcX0;
+    params.origin[1] = srcY0;
+    params.size[0] = width;
+    params.size[1] = height;
+
+    const float(*p)[4] = mRsp->P_matrix;
+    const float sx = AdjXForAspectRatio(1.0f);
+    const float vx[3] = { p[0][0] * sx, p[0][1], p[0][3] };
+    const float vz[3] = { p[2][0] * sx, p[2][1], p[2][3] };
+    const float up[3] = { p[1][0] * sx, p[1][1], p[1][3] };
+    float l[3] = { vx[1] * vz[2] - vx[2] * vz[1], vx[2] * vz[0] - vx[0] * vz[2], vx[0] * vz[1] - vx[1] * vz[0] };
+    if (l[0] * up[0] + l[1] * up[1] + l[2] * up[2] < 0.0f) {
+        for (float& c : l) {
+            c = -c;
+        }
+    }
+    const XYWidthHeight& vp = mRdp->viewport;
+    const float vw = std::max((float)vp.width, 1.0f);
+    const float vh = std::max((float)vp.height, 1.0f);
+    const float targetHeight = (mRendersToFb && !ViewportMatchesRendererResolution())
+                                   ? (float)mCurDimensions.height
+                                   : (float)mGfxCurrentWindowDimensions.height;
+    params.horizon[0] = 2.0f * l[0] / vw;
+    params.horizon[1] = -2.0f * l[1] / vh;
+    params.horizon[2] = l[0] * (-2.0f * vp.x / vw - 1.0f) + l[1] * (2.0f * (targetHeight - vp.y) / vh - 1.0f) + l[2];
+
+    mSkyFogParams = params;
+    mSkyFogSrcFb = fb_src_id;
+    sSkyFog.copies++;
+    sSkyFog.last = params;
+    sSkyFog.msaa = mMsaaLevel;
+    sSkyFog.holding = sSkyFog.hold;
+    HandOverSkyFog();
+}
+
+// Arms sky fog for the rest of this frame with mSkyFogParams, handed to the backend even if it has some already.
+void Interpreter::HandOverSkyFog() {
+    mSkyFogArmed = true;
+    mSkyFogBound = false;
+    sSkyFog.lastCopyRun = sSkyFog.runs;
+    UpdateSkyFog();
+}
+
+void Interpreter::UpdateSkyFog() {
+    const bool on = mSkyFogArmed && !mFbActive;
+    if (on == mSkyFogBound) {
+        return;
+    }
+    mRapi->SetSkyFog(on ? mSkyFogParams : SkyFogParams());
+    mSkyFogBound = on;
+}
+
+// `fog sky dump`: the copy and the finished game image of this frame, read back at 8 bits. The image is read from
+// the same target and rectangle the copy came from, so pixel (i, j) of one is pixel (i, j) of the other.
+void Interpreter::DumpSkyFog() {
+    if (!sSkyFog.dumpPending || !mSkyFogArmed) {
+        return;
+    }
+    sSkyFog.dumpPending = false;
+    const int w = mSkyFogParams.size[0];
+    const int h = mSkyFogParams.size[1];
+    std::vector<uint8_t> copy;
+    std::vector<uint8_t> frame;
+    bool ok = mRapi->ReadFramebufferRGBA8(mSkyFogParams.fbId, 0, 0, w, h, copy) &&
+              mRapi->ReadFramebufferRGBA8(mSkyFogSrcFb, mSkyFogParams.origin[0], mSkyFogParams.origin[1], w, h, frame);
+    ok = ok && WriteSkyFogPpm(sSkyFogDumpPrefix + "-copy.ppm", copy, w, h) &&
+         WriteSkyFogPpm(sSkyFogDumpPrefix + "-frame.ppm", frame, w, h);
+    sSkyFog.lastDumpOk = ok;
+    sSkyFog.dumps++;
 }
 
 void Interpreter::ResetFrameBuffer() {
