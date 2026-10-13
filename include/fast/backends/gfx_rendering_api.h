@@ -72,8 +72,9 @@ constexpr float STATIC_BAKE_LIT_W = 2.0f;
 // fast/StaticMeshCache.h: q + 256 x direction, 0-32767; at most 131070, exact in a float), so the lit
 // flag is w mod this. A vertex without wind records w = 1 or 2, exactly as before wind existed.
 // The wobble (sturdy-bassoon#216 W) rides the same scale with codes from 32768 up
-// (STATIC_BAKE_WOBBLE_W_CODE_BASE + phase, at most 33023): a code below that is wind's, one at or above
-// it the wobble's, so a recorded vertex carries one or the other.
+// (STATIC_BAKE_WOBBLE_W_CODE_BASE + (63 - depth) x 256 + phase, at most 49151 with #222's depth; w at
+// most 196606, exact in a float): a code below that is wind's, one at or above it the wobble's, so a
+// recorded vertex carries one or the other.
 constexpr float STATIC_BAKE_WIND_W_SCALE = 4.0f;
 
 // Everything a baked (pre-recorded, object-space) draw needs that used to be folded into the

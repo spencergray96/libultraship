@@ -1090,8 +1090,10 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "};\n\n";
     // The wobble's factor for a recorded w (#216 W), named after its mirror, the interpreter's
     // StaticBakeWobbleFactor, and computed in the same order: 1 for a code below
-    // STATIC_BAKE_WOBBLE_W_CODE_BASE, wind's or none; otherwise 1 - strength x (1 - cos(2 pi (cycle +
-    // phase / 256))) / 2. A list without wobble vertices has uWobble at 0, so the factor is 1 there too.
+    // STATIC_BAKE_WOBBLE_W_CODE_BASE, wind's or none; otherwise 1 - strength x depth x (1 / 63) x
+    // (1 - cos(2 pi (cycle + phase / 256))) / 2. The code above the base is (63 - depth) x 256 + phase
+    // (#222), so a depth of 63, every code before #222, scales the strength by exactly 1. A list without
+    // wobble vertices has uWobble at 0, so the factor is 1 there too.
     // The bend below splits wind's codes from the wobble's at the same value.
     const std::string wobbleFrom = std::to_string(STATIC_BAKE_WOBBLE_W_CODE_BASE) + ".0";
     cb += "float StaticBakeWobbleFactor(float w) {\n"
@@ -1099,10 +1101,13 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
           "    if (code < " +
           wobbleFrom +
           ") { return 1.0; }\n"
-          "    float p = (code - " +
+          "    float rel = code - " +
           wobbleFrom +
-          ") * (1.0 / 256.0);\n"
-          "    return 1.0 - uWobble.y * 0.5 * (1.0 - cos(6.28318531 * (uWobble.x + p)));\n"
+          ";\n"
+          "    float inv = floor(rel * (1.0 / 256.0));\n"
+          "    float p = (rel - inv * 256.0) * (1.0 / 256.0);\n"
+          "    float d = (63.0 - inv) * (1.0 / 63.0);\n"
+          "    return 1.0 - uWobble.y * d * 0.5 * (1.0 - cos(6.28318531 * (uWobble.x + p)));\n"
           "}\n\n";
 
     if (shadeMask != 0) {

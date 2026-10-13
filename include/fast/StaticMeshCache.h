@@ -110,6 +110,7 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 // not applied, so not counted). `windVertices` and `windTris` (#209 W1): the weighted vertices its
 // recording loaded, and the triangles with at least one weighted corner, the part that sways.
 // `wobbleVertices` and `wobbleTris` (#216 W): the same for wobble vertices, the part that fades.
+// `wobbleDepths` (#222): bit d set for each depth d (0-63) a recorded wobble corner carries.
 // `rejectReason` is a string literal naming why the recorder refused it, nullptr unless Rejected.
 enum class StaticBakeEntryState : int8_t { NotRegistered = -1, Unbaked = 0, Baked = 1, Rejected = 2 };
 struct StaticBakeEntryInfo {
@@ -122,6 +123,7 @@ struct StaticBakeEntryInfo {
     uint32_t windTris = 0;
     uint32_t wobbleVertices = 0;
     uint32_t wobbleTris = 0;
+    uint64_t wobbleDepths = 0;
     const char* rejectReason = nullptr;
 };
 StaticBakeEntryInfo StaticBakeGetEntry(const void* displayList);
@@ -304,14 +306,17 @@ StaticBakeWindStats StaticBakeGetWindStats();
 // see-through faces rise and fall in transparency, RS-like rather than RS-exact (sturdy-bassoon ADR
 // 2026-10-07-animated-rs-props, decisions 31-37). Wind's pattern (above): a marker in the archive, carried
 // into the recording, faded by the replay's vertex stage from frame-level parameters and the clock, and
-// mirrored by the interpreter. With strength S (0-1), speed f (Hz) and the vertex's phase p (0-255),
-// every alpha input of the vertex is multiplied by
+// mirrored by the interpreter. With strength S (0-1), speed f (Hz), the vertex's phase p (0-255) and its
+// depth d (0-63, sturdy-bassoon#222), every alpha input of the vertex is multiplied by
 //
-//     m = 1 - S x (1 - cos(2 pi (frac(f t) + p / 256))) / 2
+//     m = 1 - (S x d / 63) x (1 - cos(2 pi (frac(f t) + p / 256))) / 2
 //
-// which runs between 1 (as recorded) and 1 - S, back at 1 once a cycle. S = 0 gives m = 1 exactly, the
-// still picture. The phase is the vertex's, so each placement in a map's list keeps its own timing: the
-// generator (W's import half) writes one per placement.
+// which runs between 1 (as recorded) and 1 - S x d / 63, back at 1 once a cycle. S = 0 or d = 0 gives
+// m = 1 exactly, the still picture; d = 63 gives the frame's S exactly, the wobble before #222 to the bit.
+// The phase is the vertex's, so each placement in a map's list keeps its own timing: the generator (W's
+// import half) writes one per placement. The depth is the kind's (#222): the import writes it per kind,
+// so two kinds side by side wobble more or less strongly under one frame strength. d / 63 is computed as
+// d x (1 / 63) in float, which is exactly 1 at d = 63 and exactly 0 at d = 0.
 //
 // THE FADE IS ON THE COLOUR INPUTS' ALPHA, not shade alpha and not fog: a translucent prop's alpha is its
 // prim colour (#216 T1; fog owns shade alpha), and every combiner input reaches the vertex stage as a
@@ -325,9 +330,9 @@ StaticBakeWindStats StaticBakeGetWindStats();
 // THE CARRIER is Vtx_t.flag, in the half of its space wind leaves free (bit 15 clear; see
 // STATIC_BAKE_WOBBLE_FLAG_*), read from an archive vertex's XML `Flag`. A flag is wind or wobble, never
 // both: bit 15 set is wind's whatever the other bits hold, and the wobble form needs bit 15 clear. A
-// recording carries the phase in position.w as (1 or 2) + STATIC_BAKE_WIND_W_SCALE x code, the code above
-// wind's 1-32767: STATIC_BAKE_WOBBLE_W_CODE_BASE + p. No vertex attribute, and the recorded fog slot is
-// not used.
+// recording carries the phase and the depth in position.w as (1 or 2) + STATIC_BAKE_WIND_W_SCALE x code,
+// the code above wind's 1-32767: STATIC_BAKE_WOBBLE_W_CODE_BASE + the flag's low 14 bits, so
+// (63 - d) x 256 + p. No vertex attribute, and the recorded fog slot is not used.
 //
 // THE GUARD is wind's: only vertices loaded from an XML vertex resource are decoded, and the XML reader
 // keeps a Flag only in the wind form or the wobble form.
@@ -342,22 +347,33 @@ StaticBakeWindStats StaticBakeGetWindStats();
 // Vtx_t.flag, as an archive's XML `Flag` attribute writes it:
 //   bit 15      0 (1 is wind's: STATIC_BAKE_WIND_FLAG_MARK)
 //   bit 14      1: STATIC_BAKE_WOBBLE_FLAG_MARK, the vertex wobbles
-//   bits 8-13   0, reserved (a per-vertex depth or a group, if one is ever wanted). A flag with any of
-//               them set is not in the wobble form, and the XML reader drops it to 0
+//   bits 8-13   63 - d, the depth inverted (sturdy-bassoon#222): d 0-63 scales the frame's strength by
+//               d / 63. Inverted so that 0 there, which every flag written before #222 holds, is the full
+//               depth 63: the wobble as it was. (Until #222 these bits were reserved, and the XML reader
+//               dropped a flag with any of them set.)
 //   bits 0-7    the phase p, 0-255: p / 256 of a cycle
-// So the wobble form is exactly 0x4000-0x40FF.
+// So the wobble form is exactly 0x4000-0x7FFF, and 0x4000-0x40FF is the full depth.
 constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_MARK = 0x4000;
-constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_FORM_MASK = 0xFF00; // bit 15, the mark and the reserved bits
+constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_FORM_MASK = 0xC000; // bit 15 and the mark
 constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_PHASE_MASK = 0x00FF;
-// A recorded wobble vertex's code: this plus the phase, above every wind code (1-32767).
+constexpr int STATIC_BAKE_WOBBLE_FLAG_DEPTH_SHIFT = 8;
+constexpr uint16_t STATIC_BAKE_WOBBLE_FLAG_DEPTH_MASK = 0x3F00; // 63 - d
+constexpr uint32_t STATIC_BAKE_WOBBLE_DEPTH_MAX = 63;
+// A recorded wobble vertex's code: this plus the flag's phase and inverted depth, above every wind code
+// (1-32767).
 constexpr uint32_t STATIC_BAKE_WOBBLE_W_CODE_BASE = 32768;
 
-// The code a flag carries into a recording, STATIC_BAKE_WOBBLE_W_CODE_BASE + p (32768-33023); 0 when it
-// does not wobble.
+// The code a flag carries into a recording, STATIC_BAKE_WOBBLE_W_CODE_BASE + (63 - d) x 256 + p
+// (32768-49151; 32768-33023 at the full depth, the codes before #222); 0 when it does not wobble.
 constexpr uint16_t StaticBakeWobbleCode(uint16_t flag) {
     return (flag & STATIC_BAKE_WOBBLE_FLAG_FORM_MASK) == STATIC_BAKE_WOBBLE_FLAG_MARK
-               ? (uint16_t)(STATIC_BAKE_WOBBLE_W_CODE_BASE + (flag & STATIC_BAKE_WOBBLE_FLAG_PHASE_MASK))
+               ? (uint16_t)(STATIC_BAKE_WOBBLE_W_CODE_BASE +
+                            (flag & (STATIC_BAKE_WOBBLE_FLAG_DEPTH_MASK | STATIC_BAKE_WOBBLE_FLAG_PHASE_MASK)))
                : (uint16_t)0;
+}
+// A wobble code's depth d, 0-63 (#222).
+constexpr uint32_t StaticBakeWobbleCodeDepth(uint16_t code) {
+    return STATIC_BAKE_WOBBLE_DEPTH_MAX - ((code - STATIC_BAKE_WOBBLE_W_CODE_BASE) >> STATIC_BAKE_WOBBLE_FLAG_DEPTH_SHIFT);
 }
 // A flag is one or the other: the wobble form needs bit 15 clear, which every wind code has set, and the
 // two codes never meet in a recording's w.
@@ -367,9 +383,14 @@ static_assert((STATIC_BAKE_WOBBLE_FLAG_FORM_MASK & STATIC_BAKE_WIND_FLAG_MARK) !
 static_assert(StaticBakeWobbleCode(0xC0FF) == 0 && StaticBakeWindCode(0xC0FF) != 0,
               "a flag with both marks is wind's");
 static_assert(StaticBakeWobbleCode(0x40FF) != 0 && StaticBakeWindCode(0x40FF) == 0, "the wobble form is not wind");
-static_assert(StaticBakeWobbleCode(0x4100) == 0 && StaticBakeWobbleCode(0x4000) == STATIC_BAKE_WOBBLE_W_CODE_BASE,
-              "reserved bits set drop the form; phase 0 is a phase");
+static_assert(StaticBakeWobbleCode(0x4000) == STATIC_BAKE_WOBBLE_W_CODE_BASE && StaticBakeWobbleCodeDepth(StaticBakeWobbleCode(0x40FF)) == 63,
+              "phase 0 is a phase, and a flag with bits 8-13 clear (every flag before #222) wobbles at the full depth");
+static_assert(StaticBakeWobbleCode(0x7F00) == STATIC_BAKE_WOBBLE_W_CODE_BASE + 0x3F00 && StaticBakeWobbleCodeDepth(StaticBakeWobbleCode(0x7FFF)) == 0 &&
+                  StaticBakeWobbleCodeDepth(StaticBakeWobbleCode(0x4000 | (63 - 16) << 8)) == 16,
+              "bits 8-13 hold the depth inverted (#222)");
 static_assert(STATIC_BAKE_WOBBLE_W_CODE_BASE > 0x7FFF, "every wind code (1-32767) is below the wobble codes");
+static_assert(STATIC_BAKE_WOBBLE_W_CODE_BASE + 0x3FFF <= 0xFFFF && 2 + 4 * (STATIC_BAKE_WOBBLE_W_CODE_BASE + 0x3FFF) < (1u << 24),
+              "every wobble code (#222's depths included) fits a uint16_t and its w is a whole number exact in a float");
 
 // The frame's wobble. The defaults are the owner's pick on the #216 W bench.
 struct StaticBakeWobble {

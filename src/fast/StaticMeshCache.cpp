@@ -86,6 +86,8 @@ struct Entry {
     // at 0, as it did before the wobble existed.
     uint32_t wobbleVertices = 0;
     uint32_t wobbleTris = 0;
+    // And the depths its wobble corners carry (#222): bit d for depth d, for `staticbake props`.
+    uint64_t wobbleDepths = 0;
     const char* rejectReason = nullptr; // a literal, set wherever state becomes Rejected
 };
 
@@ -201,6 +203,10 @@ bool RecordedWeighted(float w) {
 bool RecordedWobbling(float w) {
     return w >= kWobbleWFrom;
 }
+// A wobbling corner's depth bit (#222): 1 << d for the depth its code carries.
+uint64_t RecordedWobbleDepthBit(float w) {
+    return 1ull << StaticBakeWobbleCodeDepth((uint16_t)(w * (1.0f / STATIC_BAKE_WIND_W_SCALE)));
+}
 
 // frac(speed x clock), in double so the cycle stays exact however long the session runs.
 void WobbleCycleNow() {
@@ -299,6 +305,7 @@ void ReleaseGpu(Entry& e) {
     e.windTris = 0;
     e.wobbleVertices = 0;
     e.wobbleTris = 0;
+    e.wobbleDepths = 0;
 }
 
 void AbortRecording(Interpreter* gfx, const char* reason) {
@@ -800,6 +807,7 @@ StaticBakeEntryInfo InfoOf(const Entry& e) {
             info.windTris = e.windTris;
             info.wobbleVertices = e.wobbleVertices;
             info.wobbleTris = e.wobbleTris;
+            info.wobbleDepths = e.wobbleDepths;
             break;
         case BakeState::Rejected:
             info.state = StaticBakeEntryState::Rejected;
@@ -1048,6 +1056,11 @@ void StaticBakeCaptureFlush(Interpreter* gfx) {
         if (RecordedWobbling(tri[3]) || RecordedWobbling(tri[floatsPerVertex + 3]) ||
             RecordedWobbling(tri[2 * floatsPerVertex + 3])) {
             e->wobbleTris++;
+        }
+        for (int c = 0; c < 3; c++) {
+            if (RecordedWobbling(tri[c * floatsPerVertex + 3])) {
+                e->wobbleDepths |= RecordedWobbleDepthBit(tri[c * floatsPerVertex + 3]);
+            }
         }
     }
 
@@ -1319,9 +1332,13 @@ float StaticBakeWobbleFactor(uint16_t code) {
     if (!gStaticBakeWobbleOn || code < STATIC_BAKE_WOBBLE_W_CODE_BASE) {
         return 1.0f;
     }
-    // The replay shader's StaticBakeWobble, in float, in its order.
-    const float p = (float)(code - STATIC_BAKE_WOBBLE_W_CODE_BASE) * (1.0f / 256.0f);
-    return 1.0f - sWobble.strength * 0.5f * (1.0f - cosf((float)kTau * (sWobbleCycle + p)));
+    // The replay shader's StaticBakeWobbleFactor, in float, in its order: the phase is the code's low
+    // byte, the depth (#222) its inverse above it, scaling the strength by d x (1 / 63), exactly 1 at 63.
+    const uint32_t rel = code - STATIC_BAKE_WOBBLE_W_CODE_BASE;
+    const uint32_t inv = rel >> STATIC_BAKE_WOBBLE_FLAG_DEPTH_SHIFT;
+    const float p = (float)(rel - (inv << STATIC_BAKE_WOBBLE_FLAG_DEPTH_SHIFT)) * (1.0f / 256.0f);
+    const float d = (float)(STATIC_BAKE_WOBBLE_DEPTH_MAX - inv) * (1.0f / 63.0f);
+    return 1.0f - sWobble.strength * d * 0.5f * (1.0f - cosf((float)kTau * (sWobbleCycle + p)));
 }
 
 void StaticBakeWobbleNow(float out[4]) {
