@@ -170,11 +170,15 @@ static std::string GetPathWithoutFileName(char* filePath) {
 }
 
 constexpr size_t MAX_TRI_BUFFER = 256;
+// The scratch buffer's floats per vertex. The DX11 backend sizes its dynamic vertex buffer the same, with its own
+// literal 32 (gfx_direct3d11.cpp); change both. Named for the edge layer's guard (sturdy-bassoon#230), which keeps
+// its extra float from overrunning them.
+constexpr size_t MAX_VBO_FLOATS_PER_VERTEX = 32;
 
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
-    mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
+    mBufVbo = new float[MAX_TRI_BUFFER * (MAX_VBO_FLOATS_PER_VERTEX * 3)];
 }
 
 Interpreter::~Interpreter() {
@@ -1823,13 +1827,18 @@ float FogBoundaryDistance(const FogBoundary& boundary, float x, float z) {
 static SkyFogStatus sSkyFog = {};
 static std::string sSkyFogDumpPrefix;
 
-void SkyFogSet(int fb, uint32_t mode) {
+void SkyFogSet(int fb, uint32_t mode, uint32_t scope) {
     sSkyFog.fb = mode != SKY_FOG_OFF ? fb : -1;
     sSkyFog.mode = fb >= 0 ? mode : SKY_FOG_OFF;
+    sSkyFog.scope = scope == SKY_FOG_SCOPE_EDGE ? SKY_FOG_SCOPE_EDGE : SKY_FOG_SCOPE_ALL;
 }
 
 const SkyFogStatus& SkyFogNow() {
     return sSkyFog;
+}
+
+void SkyFogNoteEdgeBakedDraw() {
+    sSkyFog.edgeBakedDraws++;
 }
 
 void SkyFogHold(bool hold) {
@@ -2125,17 +2134,22 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // transform only (OoT multiplies the view into the projection), so it takes ob - after any wind
             // bend, as the projection did - to world space. Taken before the clamp, max(a, b) clamps to
             // max(clamp(a), clamp(b)). The replay shader computes the same line (StaticBakePatchSource).
+            // The edge layer (sturdy-bassoon#230) keeps the ramp on its own too, stored as color.a is, so it never
+            // exceeds the total: a FOG_EDGE program sends that share of the fog toward the sky copy.
+            float edge_z = 0.0f;
             if (mRsp->fog_world && sFogBoundary.count != 0 && mRsp->modelview_matrix_stack_size != 0) {
                 const float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
                 const float px = ob[0] * mv[0][0] + ob[1] * mv[1][0] + ob[2] * mv[2][0] + mv[3][0];
                 const float pz = ob[0] * mv[0][2] + ob[1] * mv[1][2] + ob[2] * mv[2][2] + mv[3][2];
-                fog_z = std::max(fog_z, FogBoundaryDistance(sFogBoundary, px, pz) * sFogBoundary.mul +
-                                            sFogBoundary.offset);
+                edge_z = FogBoundaryDistance(sFogBoundary, px, pz) * sFogBoundary.mul + sFogBoundary.offset;
+                fog_z = std::max(fog_z, edge_z);
             }
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
+            d->fogEdge = Ship::Math::clamp(edge_z, 0.0f, 255.0f);
         } else {
             d->color.a = v->cn[3];
+            d->fogEdge = 0;
         }
     }
 #ifdef ENABLE_STATIC_BAKE
@@ -2309,6 +2323,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_prim_depth) {
         cc_options |= SHADER_OPT(PRIM_DEPTH);
     }
+    // The edge layer (sturdy-bassoon#230): while sky fog is bound with scope edge, a fogged triangle under world-unit
+    // fog with a boundary carries its vertices' boundary term (LoadedVertex::fogEdge) as one more float. Never in a
+    // record pass, so a recorded stream keeps its layout; the replay's edge twin computes the term itself.
+    bool fog_edge = mSkyFogEdge && use_fog && !use_blend_color && !is_rect && !bakeRecording && mRsp->fog_world &&
+                    sFogBoundary.count != 0;
+    if (fog_edge) {
+        cc_options |= SHADER_OPT(FOG_EDGE);
+    }
 
     if (!mShaderStack.empty()) {
         cc_options |= (mShaderStack.top() << SHADER_ID_SHIFT);
@@ -2468,6 +2490,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (prg == NULL) {
         comb->prg[tm] = prg =
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
+    }
+    if (fog_edge && mRapi->GetShaderNumFloats(prg) > MAX_VBO_FLOATS_PER_VERTEX) {
+        // Too wide for the scratch buffer with the extra float: the program without it, whose fog all keeps its
+        // colour - today's picture for this triangle.
+        fog_edge = false;
+        prg = LookupOrCreateShaderProgram(comb->shader_id0, (comb->shader_id1 & ~SHADER_OPT(FOG_EDGE)) |
+                                                                tm * SHADER_OPT(TEXEL0_CLAMP_S));
+    }
+    if (fog_edge) {
+        sSkyFog.edgeTris++;
     }
     if (prg != mRenderingState.mShaderProgram) {
         Flush();
@@ -2635,6 +2667,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
                 mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+            }
+            if (fog_edge) {
+                mBufVbo[mBufVboLen++] = v_arr[i]->fogEdge / 255.0f; // the boundary term's share (sturdy-bassoon#230)
             }
         }
 
@@ -5803,6 +5838,11 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     DumpSkyFog();
     mSkyFogArmed = false;
     UpdateSkyFog();
+    // The edge layer's witness (sturdy-bassoon#230): what this finished frame drew with it.
+    sSkyFog.lastEdgeTris = sSkyFog.edgeTris;
+    sSkyFog.lastEdgeBakedDraws = sSkyFog.edgeBakedDraws;
+    sSkyFog.edgeTris = 0;
+    sSkyFog.edgeBakedDraws = 0;
     // The cache's occupancy as this frame leaves it: one read here instead of one at every insert,
     // erase and clear. A clear between frames (gfx_texture_cache_clear) shows at the next frame.
     gPerfCounters.texCacheSize = mTextureCache.map.size();
@@ -5880,6 +5920,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
     // Sky-colour fog's hold (sturdy-bassoon#226; SkyFogHold): keep the copy the sky framebuffer has, and arm with it.
     if (sSkyFog.hold && sSkyFog.holding && sSkyFog.mode != SKY_FOG_OFF && fb_dst_id == sSkyFog.fb) {
         mSkyFogParams.mode = sSkyFog.mode;
+        mSkyFogParams.scope = sSkyFog.scope;
         HandOverSkyFog();
         return;
     }
@@ -5944,6 +5985,7 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
 void Interpreter::ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int width, int height) {
     SkyFogParams params;
     params.mode = sSkyFog.mode;
+    params.scope = sSkyFog.scope;
     params.fbId = fb_dst_id;
     params.origin[0] = srcX0;
     params.origin[1] = srcY0;
@@ -5993,8 +6035,11 @@ void Interpreter::UpdateSkyFog() {
     if (on == mSkyFogBound) {
         return;
     }
+    // A batch drawn so far keeps the binding it was built for; FOG_EDGE programs change with mSkyFogEdge.
+    Flush();
     mRapi->SetSkyFog(on ? mSkyFogParams : SkyFogParams());
     mSkyFogBound = on;
+    mSkyFogEdge = on && mSkyFogParams.scope == SKY_FOG_SCOPE_EDGE && mRapi->SupportsSkyFog();
 }
 
 // `fog sky dump`: the copy and the finished game image of this frame, read back at 8 bits. The image is read from
@@ -6147,6 +6192,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeat
     cc_features->opt_invisible = (shader_id1 & SHADER_OPT(INVISIBLE)) != 0;
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_prim_depth = (shader_id1 & SHADER_OPT(PRIM_DEPTH)) != 0;
+    cc_features->opt_fog_edge = (shader_id1 & SHADER_OPT(FOG_EDGE)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);

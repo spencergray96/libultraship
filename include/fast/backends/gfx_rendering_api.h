@@ -48,6 +48,10 @@ constexpr uint32_t SKY_FOG_CLAMP = 2;
 // The pixel shader's slot for the copy: t0-t1 are the combiner's textures, t2-t3 masks, t4-t5 blends. The HLSL
 // template (default.shader.hlsl) hard-codes it and SKY_FOG_CLAMP's 2, beside a comment pointing here.
 constexpr uint32_t SKY_FOG_TEXTURE_SLOT = 6;
+// Which fog takes the sky (sturdy-bassoon#230): all of it (#226 as merged), or only the boundary fog term's share
+// (the edge layer), which a FOG_EDGE program carries to the pixel stage. default.shader.hlsl hard-codes ALL's 0.
+constexpr uint32_t SKY_FOG_SCOPE_ALL = 0;
+constexpr uint32_t SKY_FOG_SCOPE_EDGE = 1;
 // Below this |b| the horizon line is near vertical (the camera rolled a quarter turn) and clamp leaves the pixel
 // alone. default.shader.hlsl's SkyFogColor uses the same value.
 constexpr float SKY_FOG_HORIZON_EPSILON = 1e-6f;
@@ -59,6 +63,7 @@ struct SkyFogParams {
     int32_t origin[2] = {};     // the render-target pixel the copy's texel (0, 0) came from
     int32_t size[2] = {};       // the copy's size in texels
     float horizon[3] = {};      // a, b, c over render-target pixels (x right, y down): a x + b y + c > 0 above it
+    uint32_t scope = SKY_FOG_SCOPE_ALL; // sturdy-bassoon#230, appended
 };
 
 // A recorded vertex that was lit under G_LIGHTING carries its raw object-space normal where its
@@ -278,6 +283,11 @@ class GfxRenderingAPI {
     // Arms (mode != SKY_FOG_OFF) or disarms the sky copy for the pixel shader's fog colour, from the next draw.
     // The interpreter calls it only on a change. A backend that ignores it, every one but DX11, fogs as before.
     virtual void SetSkyFog(const SkyFogParams& params) {
+    }
+    // Whether SetSkyFog draws anything here (sturdy-bassoon#230): the interpreter only draws a FOG_EDGE program, with
+    // its extra vertex float, on a backend whose shaders read it.
+    virtual bool SupportsSkyFog() {
+        return false;
     }
     // Reads a framebuffer's pixels as 8-bit RGBA (a debug readback for `fog sky dump`, sturdy-bassoon#226): the
     // rectangle x, y (top-left origin) by w x h, resolving MSAA first. False where unsupported or out of bounds.

@@ -80,6 +80,9 @@ enum class ShaderOpts {
     TEXEL0_BLEND,
     TEXEL1_BLEND,
     PRIM_DEPTH,
+    // The edge layer (sturdy-bassoon#230): the program also carries the boundary fog factor (FOGEDGE) to the pixel
+    // stage, whose share of the fog goes toward the sky copy. Drawn only while the edge layer is live.
+    FOG_EDGE,
     PRISM_SHADER, // 16-bit width
     MAX
 };
@@ -123,6 +126,7 @@ struct CCFeatures {
     bool do_mix[2][2];
     bool color_alpha_same[2];
     int16_t shader_id;
+    bool opt_fog_edge; // ShaderOpts::FOG_EDGE (sturdy-bassoon#230)
 };
 
 void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeatures* cc_features);
@@ -135,7 +139,11 @@ class GfxRenderingAPI;
 class GfxWindowBackend;
 
 constexpr size_t MAX_SEGMENT_POINTERS = 16;
-constexpr size_t SHADER_ID_SHIFT = 17;
+// ShaderOpts::PRISM_SHADER. Options go below it, never above bit 32: an empty shader stack ORs in -1 << this, which
+// sets every bit from here up (sturdy-bassoon#230 moved it from 17 for FOG_EDGE). ShaderIdUnmask reads the id through
+// an int, so a prism shader id must stay below 2^(31 - this): 8192 at 18.
+constexpr size_t SHADER_ID_SHIFT = 18;
+static_assert(SHADER_ID_SHIFT == static_cast<size_t>(ShaderOpts::PRISM_SHADER), "the id sits above the last option");
 constexpr int16_t ShaderIdUnmask(int id) {
     return (id >> SHADER_ID_SHIFT) & 0xFFFF;
 }
@@ -240,6 +248,9 @@ struct LoadedVertex {
     // anything drawn now multiplies every alpha input by `wobbleFactor`, which GfxSpVertex worked out.
     uint16_t wobbleCode;
     float wobbleFactor;
+    // The edge layer (sturdy-bassoon#230): the boundary fog term alone, 0..255, as GfxSpVertex floored it into
+    // color.a's total. 0 without a boundary term. Drawn only by a FOG_EDGE program.
+    uint8_t fogEdge;
 };
 
 struct RawTexMetadata {
@@ -433,6 +444,9 @@ class Interpreter {
     void DumpSkyFog();
     bool mSkyFogArmed = false;
     bool mSkyFogBound = false;
+    // The edge layer (sturdy-bassoon#230): bound with scope edge on a backend that draws sky fog, so a fogged
+    // world-mode triangle takes a FOG_EDGE program. Kept with mSkyFogBound by UpdateSkyFog.
+    bool mSkyFogEdge = false;
     int mSkyFogSrcFb = 0;
     SkyFogParams mSkyFogParams;
     void ResetFrameBuffer();
@@ -658,7 +672,9 @@ float FogBoundaryDistance(const FogBoundary& boundary, float x, float z);
 // gfx_rendering_api.h SKY_FOG_*). Only the colour changes: the fog factor, shade alpha and every vertex path are
 // untouched. Set by the game when the console changes it (WorldFog_SetSky); mode SKY_FOG_OFF or fb < 0 switches it
 // off.
-void SkyFogSet(int fb, uint32_t mode);
+// scope (sturdy-bassoon#230, SKY_FOG_SCOPE_*): ALL recolours every fogged pixel, as #226 merged; EDGE sends only the
+// boundary fog term's share of a pixel's fog toward the copy (the edge layer), and every other fog keeps its colour.
+void SkyFogSet(int fb, uint32_t mode, uint32_t scope = SKY_FOG_SCOPE_ALL);
 struct SkyFogStatus {
     int fb = -1;
     uint32_t mode = 0;      // SKY_FOG_*
@@ -672,8 +688,17 @@ struct SkyFogStatus {
     bool holding = false;   // hold has a copy of its own: the first copy since it went on was taken
     bool lastDumpOk = false;
     bool dumpPending = false;
+    // The edge layer (sturdy-bassoon#230), appended.
+    uint32_t scope = 0;           // SKY_FOG_SCOPE_*
+    uint64_t edgeTris = 0;        // triangles drawn by a FOG_EDGE program in the current rendered frame, interpreted
+    uint64_t edgeBakedDraws = 0;  // baked draws replayed by an edge twin in the current rendered frame
+    uint64_t lastEdgeTris = 0;    // the same two, for the last finished rendered frame
+    uint64_t lastEdgeBakedDraws = 0;
 };
 const SkyFogStatus& SkyFogNow();
+// The DX11 backend counts a baked draw it replayed with an edge twin (sturdy-bassoon#230):
+// SkyFogStatus::edgeBakedDraws.
+void SkyFogNoteEdgeBakedDraw();
 // `fog sky dump` (a debug readback): at the end of the next rendered frame that armed sky fog, write the copy and the
 // finished game image (before ImGui), same frame, 8 bits, as <prefix>-copy.ppm and <prefix>-frame.ppm.
 void SkyFogRequestDump(const std::string& prefix);

@@ -490,6 +490,16 @@ void GfxRenderingAPIDX11::BuildShaderProgram(struct ShaderProgramD3D11* prg, con
         ied[ied_index++] = {
             "FOG", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
+        // The edge layer (sturdy-bassoon#230): the boundary fog term, one float, only in a FOG_EDGE program.
+        if (cc_features.opt_fog_edge) {
+            ied[ied_index++] = { "FOGEDGE",
+                                 0,
+                                 DXGI_FORMAT_R32_FLOAT,
+                                 0,
+                                 D3D11_APPEND_ALIGNED_ELEMENT,
+                                 D3D11_INPUT_PER_VERTEX_DATA,
+                                 0 };
+        }
     }
     if (cc_features.opt_grayscale) {
         ied[ied_index++] = { "GRAYSCALE",
@@ -1031,16 +1041,24 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //     buffer (the wobble, sturdy-bassoon#216 W): result.inputN.a times StaticBakeWobble's factor. Only
 //     a program with alpha has alpha inputs to fade. A vertex recorded without one is not touched.
 static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0,
-                                  bool hasAlpha, int numInputs) {
+                                  bool hasAlpha, int numInputs, bool edgeTwin) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
     static const char* kUv0Marker = "result.uv0 = uv0;";
+    // The edge twin (sturdy-bassoon#230): the source is the FOG_EDGE program's, whose pixel stage reads fogEdge; the
+    // recorded stream has no such float, so its vertex input goes and the vertex stage computes it instead.
+    static const char* kFogEdgeInput = ", float fogEdge : FOGEDGE";
+    static const char* kFogEdgeMarker = "result.fogEdge = fogEdge;";
 
     const size_t posAt = src.find(kPosMarker);
     if (posAt == std::string::npos) {
         return false;
     }
     if (hasFog && src.find(kFogMarker) == std::string::npos) {
+        return false;
+    }
+    if (edgeTwin && (!hasFog || src.find(kFogEdgeInput) == std::string::npos ||
+                    src.find(kFogEdgeMarker) == std::string::npos)) {
         return false;
     }
     // A program that samples TEXEL0 has to have its pass-through line, or a scrolling draw would
@@ -1239,6 +1257,19 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
                               "        }\n"
                               "        float bakeFog = floor(clamp(bakeFogIn, 0.0, 255.0)) / 255.0;\n"
                               "        result.fog = float4(uFogColor.rgb, bakeFog);";
+        if (edgeTwin) {
+            // The edge twin (sturdy-bassoon#230): GfxSpVertex's fogEdge - the ramp alone, clamped and floored like
+            // the total, so it never exceeds result.fog.a. The plain twin's text above is left exactly as it was.
+            static const char* kRampLine = "bakeFogIn = max(bakeFogIn, bakeDist * uFogEdge.x + uFogEdge.y);";
+            static const char* kEdgeIf = "if (uFogEdge.z > 0.5) {";
+            fogCode.replace(fogCode.find(kRampLine), strlen(kRampLine),
+                            "bakeEdgeIn = bakeDist * uFogEdge.x + uFogEdge.y;\n"
+                            "            bakeFogIn = max(bakeFogIn, bakeEdgeIn);");
+            fogCode.insert(fogCode.find(kEdgeIf), "float bakeEdgeIn = 0.0;\n        ");
+            fogCode += "\n        result.fogEdge = floor(clamp(bakeEdgeIn, 0.0, 255.0)) / 255.0;";
+            src.erase(src.find(kFogEdgeInput), strlen(kFogEdgeInput));
+            src.erase(src.find(kFogEdgeMarker), strlen(kFogEdgeMarker));
+        }
         const size_t fogAt = src.find(kFogMarker);
         src.replace(fogAt, strlen(kFogMarker), fogCode);
     }
@@ -1246,8 +1277,8 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
 }
 
 struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struct ShaderProgramD3D11* base,
-                                                                           uint8_t shadeMask) {
-    const auto key = std::make_tuple(base->shader_id0, (uint32_t)base->shader_id1, shadeMask);
+                                                                           uint8_t shadeMask, bool edgeTwin) {
+    const auto key = std::make_tuple(base->shader_id0, (uint32_t)base->shader_id1, shadeMask, edgeTwin);
     auto it = mStaticShaderPool.find(key);
     if (it != mStaticShaderPool.end()) {
         // A failed compile leaves a program with no vertex shader; remember that rather than
@@ -1257,12 +1288,22 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
 
     CCFeatures cc_features;
     gfx_cc_get_features(base->shader_id0, base->shader_id1, &cc_features);
+    // The edge twin (sturdy-bassoon#230) is generated as the FOG_EDGE program, for its pixel stage, but keeps the
+    // base's input layout and stride: the recorded stream has no edge float (a record pass never sets the option).
+    const CCFeatures layoutFeatures = cc_features;
+    cc_features.opt_fog_edge = edgeTwin && cc_features.opt_fog;
+    if (edgeTwin && !cc_features.opt_fog_edge) {
+        return nullptr;
+    }
 
     // Filtered the way its base was, not the way the current mode says: a SetTextureFilter after the
     // base was built does not rebuild it, and the twin has to draw what the base would have drawn.
     size_t numFloats;
     std::string source =
         gfx_direct3d_common_build_shader(numFloats, cc_features, false, base->threePointFiltering, mSrgbMode);
+    if (edgeTwin) {
+        numFloats = base->numFloats;
+    }
 
     struct ShaderProgramD3D11* prg = &mStaticShaderPool[key];
     prg->threePointFiltering = base->threePointFiltering;
@@ -1275,7 +1316,7 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
         return nullptr;
     }
     if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0],
-                               cc_features.opt_alpha, cc_features.numInputs)) {
+                               cc_features.opt_alpha, cc_features.numInputs, edgeTwin)) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");
@@ -1290,7 +1331,7 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
     // loop - letting it escape would crash rather than degrade. The contract here is no-bake, never
     // wrong pixels, so a patched stage that will not compile just drops back to interpreted.
     try {
-        BuildShaderProgram(prg, source, cc_features, base->shader_id0, base->shader_id1, numFloats);
+        BuildShaderProgram(prg, source, layoutFeatures, base->shader_id0, base->shader_id1, numFloats);
     } catch (...) {
         SPDLOG_ERROR("[staticbake] patched shader failed to compile; shader {:#x}/{:#x} will stay interpreted",
                      base->shader_id0, base->shader_id1);
@@ -1514,8 +1555,23 @@ void GfxRenderingAPIDX11::DrawStaticTriangles(const StaticBakeDraw& draw, const 
     if (bufferId == 0 || bufferId >= mStaticBuffers.size() || !mStaticBuffers[bufferId] || draw.numTris == 0) {
         return;
     }
-    struct ShaderProgramD3D11* variant =
-        LookupOrCreateStaticShader((struct ShaderProgramD3D11*)draw.prg, draw.shadeMask);
+    // The edge layer (sturdy-bassoon#230), on the interpreter's gate read from the same state: sky fog bound with
+    // scope edge, and a boundary term in the uniforms (Replay fills its count only under world-unit fog). A program
+    // without fog has no edge twin. An edge twin that will not build falls back to the plain one, whose fog keeps its
+    // colour - today's picture.
+    const bool edgeTwin = mPerFrameCbData.sky_fog_mode != SKY_FOG_OFF &&
+                         mPerFrameCbData.sky_fog_scope == SKY_FOG_SCOPE_EDGE && uniforms.fogEdge[2] > 0.5f &&
+                         (((struct ShaderProgramD3D11*)draw.prg)->shader_id1 & SHADER_OPT(FOG)) != 0;
+    struct ShaderProgramD3D11* variant = nullptr;
+    if (edgeTwin) {
+        variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)draw.prg, draw.shadeMask, true);
+        if (variant != nullptr) {
+            SkyFogNoteEdgeBakedDraw();
+        }
+    }
+    if (variant == nullptr) {
+        variant = LookupOrCreateStaticShader((struct ShaderProgramD3D11*)draw.prg, draw.shadeMask);
+    }
     if (variant == nullptr) {
         return;
     }
@@ -1868,6 +1924,7 @@ void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
     mContext->PSSetShaderResources(SKY_FOG_TEXTURE_SLOT, 1, &view);
 
     mPerFrameCbData.sky_fog_mode = view != nullptr ? params.mode : SKY_FOG_OFF;
+    mPerFrameCbData.sky_fog_scope = params.scope; // sturdy-bassoon#230
     for (int i = 0; i < 2; i++) {
         mPerFrameCbData.sky_origin[i] = params.origin[i];
         mPerFrameCbData.sky_size[i] = params.size[i];
@@ -1882,6 +1939,10 @@ void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
     mContext->Map(mPerFrameCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     memcpy(ms.pData, &mPerFrameCbData, sizeof(PerFrameCB));
     mContext->Unmap(mPerFrameCb.Get(), 0);
+}
+
+bool GfxRenderingAPIDX11::SupportsSkyFog() {
+    return true;
 }
 
 // `fog sky dump`'s readback (sturdy-bassoon#226): full 8 bits, unlike ReadFramebufferToCPU's RGBA16. A debug path
@@ -2263,6 +2324,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_invisible", cc_features.opt_invisible },
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_prim_depth", cc_features.opt_prim_depth },
+        { "o_fog_edge", cc_features.opt_fog && cc_features.opt_fog_edge },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },

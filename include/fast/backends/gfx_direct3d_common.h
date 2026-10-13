@@ -24,7 +24,8 @@ struct PerFrameCB {
     int32_t sky_size[2] = {};
     float sky_horizon[4] = {}; // a, b, c, unused
     uint32_t sky_fog_mode = 0; // SKY_FOG_OFF until the interpreter arms it
-    uint32_t sky_padding[3] = {};
+    uint32_t sky_fog_scope = 0; // SKY_FOG_SCOPE_*, appended in sky_padding's first word (sturdy-bassoon#230)
+    uint32_t sky_padding[2] = {};
 };
 static_assert(sizeof(PerFrameCB) == 64, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
 
@@ -155,6 +156,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     bool ReadFramebufferRGBA8(int fbId, int x, int y, int w, int h, std::vector<uint8_t>& out) override;
     void SetSkyFog(const SkyFogParams& params) override;
+    bool SupportsSkyFog() override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
@@ -211,7 +213,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // The transform-enabled twin of a program, compiled on first use, lighting the colour inputs
     // in shadeMask. Null if shadeMask names an input the program lacks, if the generated HLSL did
     // not carry the markers the patch needs (see StaticBakePatchSource), or if it did not compile.
-    struct ShaderProgramD3D11* LookupOrCreateStaticShader(struct ShaderProgramD3D11* base, uint8_t shadeMask);
+    // edgeTwin (sturdy-bassoon#230): the edge twin, whose vertex stage also outputs the boundary fog term to the edge
+    // layer's pixel stage, from the same recorded stream.
+    struct ShaderProgramD3D11* LookupOrCreateStaticShader(struct ShaderProgramD3D11* base, uint8_t shadeMask,
+                                                          bool edgeTwin = false);
 
     HMODULE mDX11Module;
 
@@ -254,7 +259,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // LookupShader() can never hand the interpreter a baked program by accident. std::map nodes are
     // address-stable, which is what lets StaticMeshCache hold raw ShaderProgram* across further
     // insertions.
-    std::map<std::tuple<uint64_t, uint32_t, uint8_t>, struct ShaderProgramD3D11> mStaticShaderPool;
+    // Keyed by the edge twin flag too (sturdy-bassoon#230).
+    std::map<std::tuple<uint64_t, uint32_t, uint8_t, bool>, struct ShaderProgramD3D11> mStaticShaderPool;
     // Persistent vertex buffers for baked meshes. Index 0 is never handed out (0 means failure).
     std::vector<Microsoft::WRL::ComPtr<ID3D11Buffer>> mStaticBuffers;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mStaticBakeCb;

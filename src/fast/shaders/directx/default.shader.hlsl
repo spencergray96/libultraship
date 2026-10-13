@@ -46,6 +46,12 @@ float4 grayscale : GRAYSCALE;
         @{update_floats(3)}
     @end
 @end
+@if(o_fog_edge)
+    // The edge layer (sturdy-bassoon#230): last, so every interpolant the plain program has keeps its register. The
+    // vertex buffer still carries it right after FOG (the input layout is by semantic, gfx_direct3d11.cpp).
+    float fogEdge : FOGEDGE;
+    @{update_floats(1)}
+@end
 };
 
 @if(o_textures[0]) 
@@ -74,6 +80,7 @@ cbuffer PerFrameCB : register(b0) {
     int2 sky_size;       // the copy's size in texels
     float4 sky_horizon;  // a, b, c: a x + b y + c > 0 above the horizon, over render-target pixels
     uint sky_fog_mode;   // 0 off, 1 mirror, 2 clamp
+    uint sky_fog_scope;  // sturdy-bassoon#230, appended: 0 all fog (SKY_FOG_SCOPE_ALL), 1 the edge layer only
 }
 
 @if(o_fog)
@@ -213,6 +220,9 @@ PSInput VSMain(
 @if(o_fog)
     , float4 fog : FOG
 @end
+@if(o_fog_edge)
+    , float fogEdge : FOGEDGE
+@end
 @if(o_grayscale)
     , float4 grayscale : GRAYSCALE
 @end
@@ -243,6 +253,9 @@ PSInput VSMain(
 
     @if(o_fog)
         result.fog = fog;
+    @end
+    @if(o_fog_edge)
+        result.fogEdge = fogEdge;
     @end
 
     @if(o_grayscale)
@@ -410,13 +423,28 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
     @if(o_fog)
         // The fog factor (input.fog.a) is untouched by sky fog; only the colour it blends toward changes.
         float3 fogRgb = input.fog.rgb;
-        if (sky_fog_mode != 0) {
+        if (sky_fog_mode != 0 && sky_fog_scope == 0) {
             fogRgb = SkyFogColor(screenSpace.xy);
         }
+        @if(o_fog_edge)
+            float3 preFog = texel.rgb;
+        @end
         @if(o_alpha)
             texel = float4(lerp(texel.rgb, fogRgb, input.fog.a), texel.a);
         @else
             texel = lerp(texel, fogRgb, input.fog.a);
+        @end
+        @if(o_fog_edge)
+            // The edge layer (sturdy-bassoon#230): only the boundary term's share of the fog, input.fogEdge (never
+            // more than input.fog.a), goes toward the sky: the pixel is texel (1 - F) + fog colour (F - B) + sky B.
+            // It redoes the blend after the plain program's own lines, and only where B > 0, so wherever the term is
+            // 0 the pixel is what the plain program computes. Where B is all of the fog the target is the sky itself.
+            if (sky_fog_mode != 0 && input.fogEdge > 0.0) {
+                float3 skyRgb = SkyFogColor(screenSpace.xy);
+                float3 edgeRgb =
+                    input.fogEdge >= input.fog.a ? skyRgb : lerp(fogRgb, skyRgb, input.fogEdge / input.fog.a);
+                texel.rgb = lerp(preFog, edgeRgb, input.fog.a);
+            }
         @end
     @end
 
