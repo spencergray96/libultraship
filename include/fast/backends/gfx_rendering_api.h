@@ -64,6 +64,41 @@ struct SkyFogParams {
     int32_t size[2] = {};       // the copy's size in texels
     float horizon[3] = {};      // a, b, c over render-target pixels (x right, y down): a x + b y + c > 0 above it
     uint32_t scope = SKY_FOG_SCOPE_ALL; // sturdy-bassoon#230, appended
+    // The sky's colour (sturdy-bassoon#229), appended: the 1x1 framebuffer the reduction writes, and whether depth fog
+    // takes it - every fogged pixel whose fog colour is sceneFog (lightCtx.fogColor, 0..255) blends toward it instead.
+    int colourFbId = -1;
+    uint32_t colourOn = 0;
+    float sceneFog[3] = {};
+};
+
+// The sky's colour (sturdy-bassoon#229; interpreter.h SkyColourSet): the pixel shader's slot for the 1x1 framebuffer
+// holding it, beside the copy's. default.shader.hlsl hard-codes it.
+constexpr uint32_t SKY_COLOUR_TEXTURE_SLOT = 7;
+
+// What the reduction reads, from the interpreter at the copy (Interpreter::ArmSkyFog): every copy texel whose centre
+// lies loPx..hiPx above the horizon line (perpendicular to it), inside the 3D viewport, averaged, then smoothed toward
+// by k (1 snaps). With no texel on screen the colour holds; with no colour yet it is sceneFog.
+struct SkyColourParams {
+    int copyFbId = -1;
+    int colourFbId = -1;
+    int32_t origin[2] = {};    // the render-target pixel the copy's texel (0, 0) came from
+    int32_t size[2] = {};      // the copy's size in texels
+    int32_t viewport[4] = {};  // x0, y0, x1, y1: the 3D viewport in copy texels, clipped to the copy
+    float horizon[3] = {};     // as SkyFogParams::horizon
+    float loPx = 0.0f;
+    float hiPx = 0.0f;
+    float k = 1.0f;
+    uint32_t snap = 0;         // forget the history: start again from this frame (or sceneFog with nothing on screen)
+    float sceneFog[3] = {};    // 0..255
+};
+
+// One reduction's result, read back for the console and `fog sky dump` (debug paths only). Colours 0..255.
+struct SkyColourReadout {
+    uint64_t tag = 0;       // what the caller tagged the snapshot with (SnapshotSkyColour)
+    float colour[3] = {};   // what depth fog draws with, before the 8-bit store
+    float raw[3] = {};      // this frame's average
+    uint32_t samples = 0;   // texels averaged; 0 = held
+    float k = 0.0f;         // the smoothing step used
 };
 
 // A recorded vertex that was lit under G_LIGHTING carries its raw object-space normal where its
@@ -287,6 +322,25 @@ class GfxRenderingAPI {
     // Whether SetSkyFog draws anything here (sturdy-bassoon#230): the interpreter only draws a FOG_EDGE program, with
     // its extra vertex float, on a backend whose shaders read it.
     virtual bool SupportsSkyFog() {
+        return false;
+    }
+    // ---- The sky's colour (sturdy-bassoon#229). ----
+    // Whether ReduceSkyColour writes anything here. A backend without it leaves colourOn's fog on the fog colour.
+    virtual bool SupportsSkyColour() {
+        return false;
+    }
+    // Averages the copy's band above the horizon on the GPU and writes the smoothed colour into params.colourFbId,
+    // once per copy, before anything drawn after the copy reads it.
+    virtual void ReduceSkyColour(const SkyColourParams& params) {
+    }
+    // Debug readbacks of the last reduction: Snapshot queues one tagged copy of it, and Poll returns the oldest that
+    // is ready without waiting for the GPU (false when none is); Read waits for it.
+    virtual void SnapshotSkyColour(uint64_t tag) {
+    }
+    virtual bool PollSkyColour(SkyColourReadout& out) {
+        return false;
+    }
+    virtual bool ReadSkyColour(SkyColourReadout& out) {
         return false;
     }
     // Reads a framebuffer's pixels as 8-bit RGBA (a debug readback for `fog sky dump`, sturdy-bassoon#226): the

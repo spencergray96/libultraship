@@ -1934,6 +1934,18 @@ void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
     }
     mPerFrameCbData.sky_horizon[3] = 0.0f;
 
+    // The sky's colour (sturdy-bassoon#229): the 1x1 framebuffer the reduction wrote, on a slot of its own.
+    ID3D11ShaderResourceView* colourView = nullptr;
+    if (params.colourOn != 0 && params.colourFbId >= 0 && params.colourFbId < (int)mFrameBuffers.size()) {
+        colourView = mTextures[mFrameBuffers[params.colourFbId].texture_id].resource_view.Get();
+    }
+    mContext->PSSetShaderResources(SKY_COLOUR_TEXTURE_SLOT, 1, &colourView);
+    mPerFrameCbData.sky_colour_mode = colourView != nullptr ? 1 : 0;
+    for (int i = 0; i < 3; i++) {
+        mPerFrameCbData.sky_scene_fog[i] = params.sceneFog[i] / 255.0f;
+    }
+    mPerFrameCbData.sky_scene_fog[3] = 0.0f;
+
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
     mContext->Map(mPerFrameCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
@@ -1942,6 +1954,281 @@ void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
 }
 
 bool GfxRenderingAPIDX11::SupportsSkyFog() {
+    return true;
+}
+
+// The sky's colour (sturdy-bassoon#229). Pass 1, one thread a column: every copy texel in the band - its centre loPx
+// to hiPx above the horizon line, measured across the line, inside the viewport - summed per group of 64 columns.
+// Pass 2, one group: the partials summed into this frame's average, smoothed into the colour by k (state[0], float,
+// so a slow drift is not held behind 8-bit steps), and stored as the 1x1 texel depth fog and the haze band read. No
+// texel in the band holds the colour; no colour yet (or a snap with nothing on screen) starts it at the scene's.
+static const char* kSkyColourCsSource = R"(
+cbuffer SkyColourCB : register(b0) {
+    float4 horizon;   // a, b, c over render-target pixels (above > 0), and |(a, b)|
+    int4 viewport;    // x0, y0, x1, y1 in copy texels
+    int4 dims;        // the copy's origin in the render target (x, y), pass 1's group count, the most rows a column
+                      // reads
+    float4 band;      // loPx, hiPx, k, snap
+    float4 sceneFog;  // rgb 0..1
+};
+Texture2D<float4> copyTex : register(t0);
+RWStructuredBuffer<float4> partials : register(u0);
+RWStructuredBuffer<float4> state : register(u1);
+RWTexture2D<unorm float4> texel : register(u2);
+groupshared float4 gs[64];
+
+void ReduceGroup(uint t) {
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 32; s > 0; s >>= 1) {
+        if (t < s) {
+            gs[t] += gs[t + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ColumnsMain(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    if (abs(horizon.y) > 1e-6 && horizon.w > 0.0) {
+        uint stride = (uint)dims.z * 64;
+        for (int x = viewport.x + (int)(gid.x * 64 + tid.x); x < viewport.z; x += (int)stride) {
+            float px = x + dims.x + 0.5;
+            float ya = (band.x * horizon.w - horizon.x * px - horizon.z) / horizon.y - dims.y - 0.5;
+            float yb = (band.y * horizon.w - horizon.x * px - horizon.z) / horizon.y - dims.y - 0.5;
+            int r0 = max((int)floor(clamp(min(ya, yb), -1e6, 1e6)) - 1, viewport.y);
+            int r1 = min((int)ceil(clamp(max(ya, yb), -1e6, 1e6)) + 1, viewport.w - 1);
+            r1 = min(r1, r0 + dims.w);
+            for (int y = r0; y <= r1; y++) {
+                float d = (horizon.x * px + horizon.y * (y + dims.y + 0.5) + horizon.z) / horizon.w;
+                if (d >= band.x && d <= band.y) {
+                    acc += float4(copyTex.Load(int3(x, y, 0)).rgb, 1.0);
+                }
+            }
+        }
+    }
+    gs[tid.x] = acc;
+    ReduceGroup(tid.x);
+    if (tid.x == 0) {
+        partials[gid.x] = gs[0];
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ResolveMain(uint3 tid : SV_GroupThreadID) {
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    for (uint i = tid.x; i < (uint)dims.z; i += 64) {
+        acc += partials[i];
+    }
+    gs[tid.x] = acc;
+    ReduceGroup(tid.x);
+    if (tid.x == 0) {
+        float4 sum = gs[0];
+        float4 prev = state[0];
+        // Nothing on screen holds the colour there is; only with none yet does it start at the scene's. A snap only
+        // drops the smoothing.
+        float3 raw = sum.w > 0.0 ? sum.rgb / sum.w : (prev.w == 0.0 ? sceneFog.rgb : prev.rgb);
+        float k = prev.w == 0.0 || band.w != 0.0 ? 1.0 : band.z;
+        float3 colour = sum.w > 0.0 ? lerp(prev.rgb, raw, k) : raw;
+        state[0] = float4(colour, 1.0);
+        state[1] = float4(raw, sum.w);
+        state[2] = float4(sum.w > 0.0 ? k : 0.0, 0.0, 0.0, 0.0);
+        texel[uint2(0, 0)] = float4(colour, 1.0);
+    }
+}
+)";
+
+// The reduction's constants, mirroring SkyColourCB in kSkyColourCsSource register for register.
+struct SkyColourCB {
+    float horizon[4];
+    int32_t viewport[4];
+    int32_t dims[4];
+    float band[4];
+    float sceneFog[4];
+};
+static_assert(sizeof(SkyColourCB) == 80, "SkyColourCB's five registers");
+
+bool GfxRenderingAPIDX11::CreateSkyColourObjects() {
+    if (mSkyColourState != SkyColourObjects::NotTried) {
+        return mSkyColourState == SkyColourObjects::Ready;
+    }
+    mSkyColourState = SkyColourObjects::Failed;
+    if (mFeatureLevel < D3D_FEATURE_LEVEL_11_0) {
+        SPDLOG_INFO("[skycolour] feature level below 11_0: depth fog keeps the fog colour");
+        return false;
+    }
+    UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    ComPtr<ID3DBlob> columns, resolve, error;
+    const size_t len = strlen(kSkyColourCsSource);
+    if (FAILED(mD3dCompile(kSkyColourCsSource, len, nullptr, nullptr, nullptr, "ColumnsMain", "cs_5_0", flags, 0,
+                           columns.GetAddressOf(), error.ReleaseAndGetAddressOf())) ||
+        FAILED(mD3dCompile(kSkyColourCsSource, len, nullptr, nullptr, nullptr, "ResolveMain", "cs_5_0", flags, 0,
+                           resolve.GetAddressOf(), error.ReleaseAndGetAddressOf()))) {
+        SPDLOG_ERROR("[skycolour] compute shaders did not compile: {}",
+                     error ? (const char*)error->GetBufferPointer() : "");
+        return false;
+    }
+    auto ok = [](HRESULT hr) { return SUCCEEDED(hr); };
+    bool good = ok(mDevice->CreateComputeShader(columns->GetBufferPointer(), columns->GetBufferSize(), nullptr,
+                                                mSkyColourColumnsCs.GetAddressOf())) &&
+                ok(mDevice->CreateComputeShader(resolve->GetBufferPointer(), resolve->GetBufferSize(), nullptr,
+                                                mSkyColourResolveCs.GetAddressOf()));
+
+    D3D11_BUFFER_DESC cb = {};
+    cb.Usage = D3D11_USAGE_DYNAMIC;
+    cb.ByteWidth = sizeof(SkyColourCB);
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    good = good && ok(mDevice->CreateBuffer(&cb, nullptr, mSkyColourCb.GetAddressOf()));
+
+    // A structured float4 buffer with a UAV over all of it.
+    auto structured = [&](UINT count, ComPtr<ID3D11Buffer>& buf, ComPtr<ID3D11UnorderedAccessView>& uav) {
+        D3D11_BUFFER_DESC desc = {};
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.ByteWidth = count * 16;
+        desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        desc.StructureByteStride = 16;
+        D3D11_SUBRESOURCE_DATA zero = {};
+        std::vector<float> zeros(count * 4, 0.0f);
+        zero.pSysMem = zeros.data();
+        D3D11_UNORDERED_ACCESS_VIEW_DESC view = {};
+        view.Format = DXGI_FORMAT_UNKNOWN;
+        view.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        view.Buffer.NumElements = count;
+        return ok(mDevice->CreateBuffer(&desc, &zero, buf.GetAddressOf())) &&
+               ok(mDevice->CreateUnorderedAccessView(buf.Get(), &view, uav.GetAddressOf()));
+    };
+    good = good && structured(kSkyColourMaxGroups, mSkyColourPartials, mSkyColourPartialsUav) &&
+           structured(kSkyColourStateFloat4s, mSkyColourStateBuf, mSkyColourStateUav);
+
+    D3D11_TEXTURE2D_DESC tex = {};
+    tex.Width = 1;
+    tex.Height = 1;
+    tex.MipLevels = 1;
+    tex.ArraySize = 1;
+    tex.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // the framebuffers' format, so CopyResource takes it
+    tex.SampleDesc.Count = 1;
+    tex.Usage = D3D11_USAGE_DEFAULT;
+    tex.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    good = good && ok(mDevice->CreateTexture2D(&tex, nullptr, mSkyColourTexel.GetAddressOf())) &&
+           ok(mDevice->CreateUnorderedAccessView(mSkyColourTexel.Get(), nullptr, mSkyColourTexelUav.GetAddressOf()));
+
+    D3D11_BUFFER_DESC staging = {};
+    staging.Usage = D3D11_USAGE_STAGING;
+    staging.ByteWidth = kSkyColourStateFloat4s * 16;
+    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    for (int i = 0; i < kSkyColourRing && good; i++) {
+        good = ok(mDevice->CreateBuffer(&staging, nullptr, mSkyColourStaging[i].GetAddressOf()));
+    }
+    good = good && ok(mDevice->CreateBuffer(&staging, nullptr, mSkyColourReadStaging.GetAddressOf()));
+
+    if (!good) {
+        SPDLOG_ERROR("[skycolour] could not create its GPU objects: depth fog keeps the fog colour");
+        return false;
+    }
+    mSkyColourState = SkyColourObjects::Ready;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::SupportsSkyColour() {
+    return CreateSkyColourObjects();
+}
+
+void GfxRenderingAPIDX11::ReduceSkyColour(const SkyColourParams& params) {
+    if (!CreateSkyColourObjects() || params.copyFbId < 0 || params.copyFbId >= (int)mFrameBuffers.size() ||
+        params.colourFbId < 0 || params.colourFbId >= (int)mFrameBuffers.size()) {
+        return;
+    }
+    const int width = std::max(params.viewport[2] - params.viewport[0], 0);
+    const int groups = std::clamp((width + 63) / 64, 1, kSkyColourMaxGroups);
+
+    SkyColourCB cb;
+    const float n = std::sqrt(params.horizon[0] * params.horizon[0] + params.horizon[1] * params.horizon[1]);
+    cb = { { params.horizon[0], params.horizon[1], params.horizon[2], n },
+           { params.viewport[0], params.viewport[1], params.viewport[2], params.viewport[3] },
+           { params.origin[0], params.origin[1], groups, kSkyColourMaxRows },
+           { params.loPx, params.hiPx, params.k, params.snap != 0 ? 1.0f : 0.0f },
+           { params.sceneFog[0] / 255.0f, params.sceneFog[1] / 255.0f, params.sceneFog[2] / 255.0f, 0.0f } };
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(mContext->Map(mSkyColourCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return;
+    }
+    memcpy(ms.pData, &cb, sizeof(cb));
+    mContext->Unmap(mSkyColourCb.Get(), 0);
+
+    ID3D11ShaderResourceView* copy = mTextures[mFrameBuffers[params.copyFbId].texture_id].resource_view.Get();
+    ID3D11UnorderedAccessView* uavs[3] = { mSkyColourPartialsUav.Get(), mSkyColourStateUav.Get(),
+                                           mSkyColourTexelUav.Get() };
+    mContext->CSSetConstantBuffers(0, 1, mSkyColourCb.GetAddressOf());
+    mContext->CSSetShaderResources(0, 1, &copy);
+    mContext->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    mContext->CSSetShader(mSkyColourColumnsCs.Get(), nullptr, 0);
+    mContext->Dispatch(groups, 1, 1);
+    mContext->CSSetShader(mSkyColourResolveCs.Get(), nullptr, 0);
+    mContext->Dispatch(1, 1, 1);
+
+    // Unbound again, so the copy's texture and these buffers are never left on the compute stage.
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    ID3D11UnorderedAccessView* noUavs[3] = {};
+    mContext->CSSetShaderResources(0, 1, &noSrv);
+    mContext->CSSetUnorderedAccessViews(0, 3, noUavs, nullptr);
+    mContext->CSSetShader(nullptr, nullptr, 0);
+
+    mContext->CopyResource(mTextures[mFrameBuffers[params.colourFbId].texture_id].texture.Get(),
+                           mSkyColourTexel.Get());
+}
+
+static void SkyColourFromState(const float* f, SkyColourReadout& out) {
+    for (int i = 0; i < 3; i++) {
+        out.colour[i] = f[i] * 255.0f;
+        out.raw[i] = f[4 + i] * 255.0f;
+    }
+    out.samples = (uint32_t)f[7];
+    out.k = f[8];
+}
+
+void GfxRenderingAPIDX11::SnapshotSkyColour(uint64_t tag) {
+    if (mSkyColourState != SkyColourObjects::Ready) {
+        return;
+    }
+    // A full ring drops its oldest snapshot.
+    if (mSkyColourRingCount == kSkyColourRing) {
+        mSkyColourRingCount--;
+    }
+    mContext->CopyResource(mSkyColourStaging[mSkyColourRingHead].Get(), mSkyColourStateBuf.Get());
+    mSkyColourStagingTag[mSkyColourRingHead] = tag;
+    mSkyColourRingHead = (mSkyColourRingHead + 1) % kSkyColourRing;
+    mSkyColourRingCount++;
+}
+
+bool GfxRenderingAPIDX11::PollSkyColour(SkyColourReadout& out) {
+    if (mSkyColourState != SkyColourObjects::Ready || mSkyColourRingCount == 0) {
+        return false;
+    }
+    const int slot = (mSkyColourRingHead - mSkyColourRingCount + kSkyColourRing) % kSkyColourRing;
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (mContext->Map(mSkyColourStaging[slot].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &ms) != S_OK) {
+        return false; // still in flight
+    }
+    SkyColourFromState((const float*)ms.pData, out);
+    mContext->Unmap(mSkyColourStaging[slot].Get(), 0);
+    out.tag = mSkyColourStagingTag[slot];
+    mSkyColourRingCount--;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ReadSkyColour(SkyColourReadout& out) {
+    if (mSkyColourState != SkyColourObjects::Ready) {
+        return false;
+    }
+    mContext->CopyResource(mSkyColourReadStaging.Get(), mSkyColourStateBuf.Get());
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(mContext->Map(mSkyColourReadStaging.Get(), 0, D3D11_MAP_READ, 0, &ms))) {
+        return false;
+    }
+    SkyColourFromState((const float*)ms.pData, out);
+    mContext->Unmap(mSkyColourReadStaging.Get(), 0);
     return true;
 }
 

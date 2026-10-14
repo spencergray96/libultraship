@@ -20,6 +20,7 @@
 #include <vector>
 #include <list>
 #include <stack>
+#include <chrono>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -1849,6 +1850,57 @@ void SkyFogHold(bool hold) {
 void SkyFogRequestDump(const std::string& prefix) {
     sSkyFogDumpPrefix = prefix;
     sSkyFog.dumpPending = !prefix.empty();
+}
+
+// The sky's colour (sturdy-bassoon#229; interpreter.h SkyColourSet). Set by the game every tick; a copy into its
+// copyFb runs the reduction (Interpreter::ReduceSkyColour).
+static SkyColourStatus sSkyColour = {};
+static bool sSkyColourSnap = true;
+static FILE* sSkyColourLog = nullptr;
+
+void SkyColourSet(const SkyColourSettings& settings) {
+    if (settings.on && !sSkyColour.settings.on) {
+        sSkyColourSnap = true; // never smooth from a colour another scene or another session left
+    }
+    sSkyColour.settings = settings;
+}
+
+bool SkyColourSupported() {
+    auto gfx = mInstance.lock();
+    return gfx != nullptr && gfx->mRapi->SupportsSkyColour();
+}
+
+void SkyColourSnap() {
+    sSkyColourSnap = true;
+}
+
+void SkyColourRequestReadout() {
+    sSkyColour.readoutPending = true;
+}
+
+bool SkyColourLog(const std::string& path) {
+    if (sSkyColourLog != nullptr) {
+        fclose(sSkyColourLog);
+        sSkyColourLog = nullptr;
+    }
+    sSkyColour.logging = false;
+    if (path.empty()) {
+        return true;
+    }
+    sSkyColourLog = fopen(path.c_str(), "w");
+    sSkyColour.logging = sSkyColourLog != nullptr;
+    sSkyColour.logged = 0;
+    return sSkyColour.logging;
+}
+
+const SkyColourStatus& SkyColourNow() {
+    return sSkyColour;
+}
+
+// Whether a copy into fb is the sky copy: sky fog's (sturdy-bassoon#226) or the sky colour's.
+static bool IsSkyCopy(int fb) {
+    return (sSkyFog.mode != SKY_FOG_OFF && fb == sSkyFog.fb) ||
+           (sSkyColour.settings.on && fb == sSkyColour.settings.copyFb);
 }
 
 // A binary PPM (P6): RGB, 8 bits, no dependencies. rgba is w x h, top row first.
@@ -5794,6 +5846,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->StartFrame();
     // Sky-colour fog (sturdy-bassoon#226) starts every rendered frame disarmed: only this frame's copy arms it.
     sSkyFog.runs++;
+    sSkyColour.live = false; // until this frame's copy arms it (sturdy-bassoon#229)
     mSkyFogArmed = false;
     UpdateSkyFog();
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
@@ -5836,6 +5889,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     Flush();
     // Sky-colour fog (sturdy-bassoon#226): a pending dump reads this finished frame, then the copy is unbound.
     DumpSkyFog();
+    FinishSkyColour(); // the sky colour's debug readbacks (sturdy-bassoon#229)
     mSkyFogArmed = false;
     UpdateSkyFog();
     // The edge layer's witness (sturdy-bassoon#230): what this finished frame drew with it.
@@ -5918,9 +5972,10 @@ void Interpreter::SetFrameBuffer(int fb, float noiseScale) {
 
 void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, bool* hasCopiedPtr) {
     // Sky-colour fog's hold (sturdy-bassoon#226; SkyFogHold): keep the copy the sky framebuffer has, and arm with it.
-    if (sSkyFog.hold && sSkyFog.holding && sSkyFog.mode != SKY_FOG_OFF && fb_dst_id == sSkyFog.fb) {
+    if (sSkyFog.hold && sSkyFog.holding && IsSkyCopy(fb_dst_id)) {
         mSkyFogParams.mode = sSkyFog.mode;
         mSkyFogParams.scope = sSkyFog.scope;
+        FillSkyColour(mSkyFogParams, false); // the colour the held copy was reduced to stays in its framebuffer
         HandOverSkyFog();
         return;
     }
@@ -5965,8 +6020,9 @@ void Interpreter::CopyFrameBuffer(int fb_dst_id, int fb_src_id, bool copyOnce, b
         *hasCopiedPtr = true;
     }
 
-    // Sky-colour fog (sturdy-bassoon#226): a copy into the sky framebuffer is the sky, and arms the fog colour.
-    if (sSkyFog.mode != SKY_FOG_OFF && fb_dst_id == sSkyFog.fb) {
+    // Sky-colour fog (sturdy-bassoon#226): a copy into the sky framebuffer is the sky, and arms the fog colour - and
+    // the sky's colour (sturdy-bassoon#229), which may want the copy with sky fog off.
+    if (IsSkyCopy(fb_dst_id)) {
         ArmSkyFog(fb_dst_id, fb_src_id, srcX0, srcY0, dstX1 - dstX0, dstY1 - dstY0);
     }
 }
@@ -6013,6 +6069,20 @@ void Interpreter::ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, 
     params.horizon[1] = -2.0f * l[1] / vh;
     params.horizon[2] = l[0] * (-2.0f * vp.x / vw - 1.0f) + l[1] * (2.0f * (targetHeight - vp.y) / vh - 1.0f) + l[2];
 
+    // The sky's colour (sturdy-bassoon#229): the reduction, before anything after the copy reads it. Its band is in
+    // degrees, turned into pixels with the focal length: cot(fovy / 2) is the ratio of the lengths of P's y and w
+    // columns over its direction rows (the viewing matrix is a rotation, and the projection's scale cancels), so a
+    // degree is (vh / 2) cot(fovy / 2) tan(1 degree) pixels - exact for a level camera at the centre, near enough
+    // across a band that is averaged. The viewport is the 3D one, in render-target pixels as the line is.
+    FillSkyColour(params, true);
+    if (params.colourOn != 0) {
+        const float py = sqrtf(p[0][1] * p[0][1] + p[1][1] * p[1][1] + p[2][1] * p[2][1]);
+        const float pw = sqrtf(p[0][3] * p[0][3] + p[1][3] * p[1][3] + p[2][3] * p[2][3]);
+        const float top = targetHeight - vp.y - vh;
+        const float viewport[4] = { (float)vp.x, top, vp.x + vw, top + vh };
+        ReduceSkyColour(params, viewport, pw > 0.0f ? 0.5f * vh * py / pw : 0.0f);
+    }
+
     mSkyFogParams = params;
     mSkyFogSrcFb = fb_src_id;
     sSkyFog.copies++;
@@ -6039,7 +6109,11 @@ void Interpreter::UpdateSkyFog() {
     Flush();
     mRapi->SetSkyFog(on ? mSkyFogParams : SkyFogParams());
     mSkyFogBound = on;
-    mSkyFogEdge = on && mSkyFogParams.scope == SKY_FOG_SCOPE_EDGE && mRapi->SupportsSkyFog();
+    mSkyFogEdge = on && mSkyFogParams.mode != SKY_FOG_OFF && mSkyFogParams.scope == SKY_FOG_SCOPE_EDGE &&
+                  mRapi->SupportsSkyFog();
+    if (on && mSkyFogParams.colourOn != 0) {
+        sSkyColour.live = true;
+    }
 }
 
 // `fog sky dump`: the copy and the finished game image of this frame, read back at 8 bits. The image is read from
@@ -6057,8 +6131,108 @@ void Interpreter::DumpSkyFog() {
               mRapi->ReadFramebufferRGBA8(mSkyFogSrcFb, mSkyFogParams.origin[0], mSkyFogParams.origin[1], w, h, frame);
     ok = ok && WriteSkyFogPpm(sSkyFogDumpPrefix + "-copy.ppm", copy, w, h) &&
          WriteSkyFogPpm(sSkyFogDumpPrefix + "-frame.ppm", frame, w, h);
+    // The sky's colour (sturdy-bassoon#229), when this frame reduced one: what it was reduced from and to, so a check
+    // can rebuild the band from the copy above. Texel coordinates are the copy's; the line is over render-target
+    // pixels, as the copy's origin places them.
+    if (ok && sSkyColour.reductions != 0 && sSkyColour.lastRun == sSkyFog.runs) {
+        SkyColourReadout r;
+        const SkyColourParams& c = sSkyColour.last;
+        FILE* f = mRapi->ReadSkyColour(r) ? fopen((sSkyFogDumpPrefix + "-colour.txt").c_str(), "w") : nullptr;
+        ok = f != nullptr;
+        if (f != nullptr) {
+            fprintf(f,
+                    "colour=%.4f,%.4f,%.4f raw=%.4f,%.4f,%.4f samples=%u k=%.6f snap=%u horizon=%.9g,%.9g,%.9g "
+                    "origin=%d,%d size=%dx%d viewport=%d,%d,%d,%d lo_px=%.6f hi_px=%.6f scene=%g,%g,%g\n",
+                    r.colour[0], r.colour[1], r.colour[2], r.raw[0], r.raw[1], r.raw[2], r.samples, r.k, c.snap,
+                    c.horizon[0], c.horizon[1], c.horizon[2], c.origin[0], c.origin[1], c.size[0], c.size[1],
+                    c.viewport[0], c.viewport[1], c.viewport[2], c.viewport[3], c.loPx, c.hiPx, c.sceneFog[0],
+                    c.sceneFog[1], c.sceneFog[2]);
+            ok = fclose(f) == 0;
+        }
+    }
     sSkyFog.lastDumpOk = ok;
     sSkyFog.dumps++;
+}
+
+// The sky's colour (sturdy-bassoon#229): whether this copy's frame fogs toward it, and with what. Not while sky fog's
+// scope is all, whose per-pixel sky wins, and never from a framebuffer no reduction has written: reducing says this
+// copy is about to write it; a held copy (no reduction) needs one before.
+void Interpreter::FillSkyColour(SkyFogParams& params, bool reducing) {
+    const SkyColourSettings& c = sSkyColour.settings;
+    const bool allScope = params.mode != SKY_FOG_OFF && params.scope == SKY_FOG_SCOPE_ALL;
+    const bool written = reducing || sSkyColour.reductions != 0;
+    params.colourOn = c.on && !allScope && c.colourFb >= 0 && written && mRapi->SupportsSkyColour() ? 1 : 0;
+    params.colourFbId = c.colourFb;
+    for (int i = 0; i < 3; i++) {
+        params.sceneFog[i] = c.sceneFog[i];
+    }
+}
+
+// The reduction for this copy: the band in pixels, the viewport in the copy's texels, and the smoothing step. It snaps
+// - this frame's average, no history - on the first one, after a rendered frame without one (a scene load, the pause
+// menu, a hold), when the copy's size changes, or when asked. Otherwise k = 1 - exp(-dt / tau), dt the time since the
+// last one (at most 0.1 s), so the colour settles at the same rate at any frame rate.
+void Interpreter::ReduceSkyColour(const SkyFogParams& params, const float viewport[4], float pxPerTan) {
+    const SkyColourSettings& c = sSkyColour.settings;
+    constexpr float kRadians = 3.14159265358979f / 180.0f;
+    SkyColourParams r;
+    r.copyFbId = params.fbId;
+    r.colourFbId = params.colourFbId;
+    for (int i = 0; i < 2; i++) {
+        r.origin[i] = params.origin[i];
+        r.size[i] = params.size[i];
+        r.viewport[i] = std::clamp((int)lroundf(viewport[i]) - params.origin[i], 0, params.size[i]);
+        r.viewport[2 + i] = std::clamp((int)lroundf(viewport[2 + i]) - params.origin[i], 0, params.size[i]);
+    }
+    for (int i = 0; i < 3; i++) {
+        r.horizon[i] = params.horizon[i];
+        r.sceneFog[i] = c.sceneFog[i];
+    }
+    r.loPx = pxPerTan * tanf(c.loDeg * kRadians);
+    r.hiPx = pxPerTan * tanf(c.hiDeg * kRadians);
+
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const bool snap = sSkyColourSnap || sSkyColour.reductions == 0 || sSkyColour.lastRun + 1 != sSkyFog.runs ||
+                      r.size[0] != sSkyColour.last.size[0] || r.size[1] != sSkyColour.last.size[1];
+    const float dt = snap ? 0.0f : (float)std::clamp(now - mSkyColourLastTime, 0.0, 0.1);
+    r.snap = snap ? 1 : 0;
+    r.k = snap || c.tau <= 0.0f ? 1.0f : 1.0f - expf(-dt / c.tau);
+    mRapi->ReduceSkyColour(r);
+
+    sSkyColourSnap = false;
+    mSkyColourLastTime = now;
+    sSkyColour.reductions++;
+    sSkyColour.lastRun = sSkyFog.runs;
+    sSkyColour.last = r;
+    sSkyColour.lastDt = dt;
+    if (sSkyColourLog != nullptr) {
+        mRapi->SnapshotSkyColour(sSkyFog.runs);
+    }
+}
+
+// The sky colour's debug readbacks, at the end of a rendered frame: a status readout once this frame has reduced, and
+// the log's lines for every snapshot the GPU has finished with (a few frames behind, never waiting).
+void Interpreter::FinishSkyColour() {
+    if (sSkyColour.readoutPending && sSkyColour.reductions != 0 && sSkyColour.lastRun == sSkyFog.runs) {
+        sSkyColour.readoutPending = false;
+        sSkyColour.readoutOk = mRapi->ReadSkyColour(sSkyColour.readout);
+        sSkyColour.readoutRun = sSkyFog.runs;
+    }
+    if (sSkyColourLog == nullptr) {
+        return;
+    }
+    SkyColourReadout r;
+    bool wrote = false;
+    while (mRapi->PollSkyColour(r)) {
+        fprintf(sSkyColourLog, "run=%llu colour=%.3f,%.3f,%.3f raw=%.3f,%.3f,%.3f samples=%u k=%.5f\n",
+                (unsigned long long)r.tag, r.colour[0], r.colour[1], r.colour[2], r.raw[0], r.raw[1], r.raw[2],
+                r.samples, r.k);
+        sSkyColour.logged++;
+        wrote = true;
+    }
+    if (wrote) {
+        fflush(sSkyColourLog);
+    }
 }
 
 void Interpreter::ResetFrameBuffer() {

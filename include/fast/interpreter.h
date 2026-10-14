@@ -449,6 +449,11 @@ class Interpreter {
     bool mSkyFogEdge = false;
     int mSkyFogSrcFb = 0;
     SkyFogParams mSkyFogParams;
+    // The sky's colour (sturdy-bassoon#229; SkyColourSet below): the reduction at the copy, and what it last ran with.
+    void FillSkyColour(SkyFogParams& params, bool reducing);
+    void ReduceSkyColour(const SkyFogParams& params, const float viewport[4], float pxPerTan);
+    void FinishSkyColour();
+    double mSkyColourLastTime = 0.0;
     void ResetFrameBuffer();
     void AdjustPixelDepthCoordinates(float& x, float& y);
     void GetPixelDepthPrepare(float x, float y);
@@ -707,6 +712,50 @@ void SkyFogRequestDump(const std::string& prefix);
 // Switching it on always takes one fresh copy first, so it never holds one from another scene or window size.
 // The horizon line is the held copy's too: for a camera that does not move.
 void SkyFogHold(bool hold);
+
+// The sky's colour (sturdy-bassoon#229): depth fog takes the live sky's colour just above the horizon instead of the
+// scene's fog colour. At each copy into copyFb (the sky copy, which Play_Draw emits while this or sky fog wants it),
+// the backend averages the copy's band loDeg..hiDeg above #226's horizon line across the viewport's width, smooths
+// it with time constant tau seconds (0: none), and writes it into the 1x1 framebuffer colourFb. Every fogged pixel
+// whose fog colour is sceneFog (lightCtx.fogColor, as Play_SetFog emitted it this tick) then blends toward it; the
+// amount is untouched, and so is any fog toward another colour. Off while sky fog's scope is all (#226's per-pixel
+// colour wins), under an off-screen G_SETFB target, on a backend without it (SkyColourSupported), and in a frame
+// without a copy. Set by the game every tick (WorldFog_SetColour).
+struct SkyColourSettings {
+    bool on = false;
+    int copyFb = -1;
+    int colourFb = -1;
+    uint8_t sceneFog[3] = {};
+    float loDeg = 0.5f;
+    float hiDeg = 3.0f;
+    float tau = 0.25f;
+};
+void SkyColourSet(const SkyColourSettings& settings);
+// Whether this backend reduces the colour at all (DX11 at feature level 11_0 and up), so the game can draw the haze
+// band with it rather than with the fog colour.
+bool SkyColourSupported();
+// The next reduction starts again from that frame's average, as after a frame without a copy.
+void SkyColourSnap();
+// Debug readbacks: the last reduction read back at the end of the next rendered frame that ran one (status), and
+// a log of every reduction's result, one line a rendered frame, through a staging ring that never waits for the GPU
+// (path empty stops it). False when the file cannot be opened.
+void SkyColourRequestReadout();
+bool SkyColourLog(const std::string& path);
+struct SkyColourStatus {
+    SkyColourSettings settings;
+    uint64_t reductions = 0;
+    uint64_t lastRun = 0;          // SkyFogStatus::runs of the last reduction
+    SkyColourParams last;          // what it ran with
+    float lastDt = 0.0f;           // seconds since the one before
+    bool live = false;             // the last rendered frame's depth fog took the colour
+    SkyColourReadout readout;      // the last readback
+    uint64_t readoutRun = 0;
+    bool readoutOk = false;
+    bool readoutPending = false;
+    bool logging = false;
+    uint64_t logged = 0;           // lines written since the log started
+};
+const SkyColourStatus& SkyColourNow();
 
 } // namespace Fast
 

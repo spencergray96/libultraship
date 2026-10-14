@@ -25,9 +25,13 @@ struct PerFrameCB {
     float sky_horizon[4] = {}; // a, b, c, unused
     uint32_t sky_fog_mode = 0; // SKY_FOG_OFF until the interpreter arms it
     uint32_t sky_fog_scope = 0; // SKY_FOG_SCOPE_*, appended in sky_padding's first word (sturdy-bassoon#230)
-    uint32_t sky_padding[2] = {};
+    // The sky's colour (sturdy-bassoon#229), appended: sky_colour_mode in sky_padding's first word, then a register
+    // of its own for the scene's fog colour (0..1, w unused) that the pixel shader matches a draw's fog colour against.
+    uint32_t sky_colour_mode = 0;
+    uint32_t sky_padding = 0;
+    float sky_scene_fog[4] = {};
 };
-static_assert(sizeof(PerFrameCB) == 64, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
+static_assert(sizeof(PerFrameCB) == 80, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
 
 struct PerDrawCB {
     struct Texture {
@@ -157,6 +161,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool ReadFramebufferRGBA8(int fbId, int x, int y, int w, int h, std::vector<uint8_t>& out) override;
     void SetSkyFog(const SkyFogParams& params) override;
     bool SupportsSkyFog() override;
+    bool SupportsSkyColour() override;
+    void ReduceSkyColour(const SkyColourParams& params) override;
+    void SnapshotSkyColour(uint64_t tag) override;
+    bool PollSkyColour(SkyColourReadout& out) override;
+    bool ReadSkyColour(SkyColourReadout& out) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
@@ -240,6 +249,33 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
     Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
     size_t mCoordBufferSize;
+
+    // The sky's colour (sturdy-bassoon#229; ReduceSkyColour). Built on the first SupportsSkyColour, feature level 11_0
+    // and up: two compute passes (the band's columns into per-group partials, then those into the colour), the float
+    // state they smooth in, a 1x1 UAV texture copied into the colour framebuffer, and a staging ring for the debug
+    // readbacks. Unused until the game asks for the colour.
+    bool CreateSkyColourObjects();
+    enum class SkyColourObjects { NotTried, Ready, Failed };
+    SkyColourObjects mSkyColourState = SkyColourObjects::NotTried;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mSkyColourColumnsCs;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mSkyColourResolveCs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSkyColourCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSkyColourPartials;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mSkyColourPartialsUav;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSkyColourStateBuf;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mSkyColourStateUav;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mSkyColourTexel;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mSkyColourTexelUav;
+    static constexpr int kSkyColourRing = 4;
+    static constexpr int kSkyColourMaxGroups = 256; // pass 1's groups of 64 columns: 16,384 columns, then they stride
+    // The most rows one column reads: a camera rolled near a quarter turn stretches the band down the column.
+    static constexpr int kSkyColourMaxRows = 1024;
+    static constexpr int kSkyColourStateFloat4s = 4;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSkyColourStaging[kSkyColourRing];
+    uint64_t mSkyColourStagingTag[kSkyColourRing] = {};
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mSkyColourReadStaging; // ReadSkyColour's, outside the ring
+    int mSkyColourRingHead = 0;  // the next slot Snapshot writes
+    int mSkyColourRingCount = 0; // snapshots queued and not yet polled
 
 #if DEBUG_D3D
     Microsoft::WRL::ComPtr<ID3D11Debug> debug;

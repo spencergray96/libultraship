@@ -81,10 +81,17 @@ cbuffer PerFrameCB : register(b0) {
     float4 sky_horizon;  // a, b, c: a x + b y + c > 0 above the horizon, over render-target pixels
     uint sky_fog_mode;   // 0 off, 1 mirror, 2 clamp
     uint sky_fog_scope;  // sturdy-bassoon#230, appended: 0 all fog (SKY_FOG_SCOPE_ALL), 1 the edge layer only
+    // The sky's colour (sturdy-bassoon#229), appended: 1 while depth fog takes it, and the scene's fog colour (0..1)
+    // a draw's fog colour must be for it to. Its own register, as in PerFrameCB.
+    uint sky_colour_mode;
+    float4 sky_scene_fog;
 }
 
 @if(o_fog)
 Texture2D g_skyCopy : register(t6);
+// The sky's colour (sturdy-bassoon#229): one texel, the band above the horizon averaged on the GPU at the copy
+// (gfx_rendering_api.h SKY_COLOUR_TEXTURE_SLOT).
+Texture2D g_skyColour : register(t7);
 
 // Sky-colour fog (sturdy-bassoon#226): the sky copy's colour under render-target pixel pos - the frame as it was
 // just before the rooms drew. Mirror reads it as it is; clamp reads a pixel below the horizon from two pixels above
@@ -426,14 +433,20 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
         if (sky_fog_mode != 0 && sky_fog_scope == 0) {
             fogRgb = SkyFogColor(screenSpace.xy);
         }
-        @if(o_fog_edge)
-            float3 preFog = texel.rgb;
-        @end
+        float3 preFog = texel.rgb;
         @if(o_alpha)
             texel = float4(lerp(texel.rgb, fogRgb, input.fog.a), texel.a);
         @else
             texel = lerp(texel, fogRgb, input.fog.a);
         @end
+        // The sky's colour (sturdy-bassoon#229): fog toward the scene's fog colour - lightCtx.fogColor, which a draw's
+        // fog colour equals unless an actor set its own - goes toward the sky's colour just above the horizon instead.
+        // Like the edge layer, it redoes the blend after the plain program's own lines, from the pre-fog texel, so
+        // where it is off the pixel is what the plain program computes. The amount, input.fog.a, is untouched.
+        if (sky_colour_mode != 0 && all(abs(input.fog.rgb - sky_scene_fog.rgb) < 0.5 / 255.0)) {
+            fogRgb = g_skyColour.Load(int3(0, 0, 0)).rgb;
+            texel.rgb = lerp(preFog, fogRgb, input.fog.a);
+        }
         @if(o_fog_edge)
             // The edge layer (sturdy-bassoon#230): only the boundary term's share of the fog, input.fogEdge (never
             // more than input.fog.a), goes toward the sky: the pixel is texel (1 - F) + fog colour (F - B) + sky B.
