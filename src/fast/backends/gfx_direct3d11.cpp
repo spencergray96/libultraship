@@ -1961,14 +1961,15 @@ bool GfxRenderingAPIDX11::SupportsSkyFog() {
 }
 
 // The sky's colour (sturdy-bassoon#229). Pass 1, one thread a column: every copy texel in the band - its centre loPx
-// to hiPx above the horizon line, measured across the line, inside the viewport - summed per group of 64 columns.
-// Pass 2, one group: the partials summed into this frame's average, smoothed into the colour by k (state[0], float,
-// so a slow drift is not held behind 8-bit steps), and stored as the 1x1 texel depth fog and the haze band read. No
-// texel in the band holds the colour; no colour yet (or a snap with nothing on screen) starts it at the scene's.
+// to hiPx above the horizon line, measured across the line, inside the texels the sky drew (sturdy-bassoon#241) -
+// summed per group of 64 columns. Pass 2, one group: the partials summed into this frame's average, smoothed into the
+// colour by k (state[0], float, so a slow drift is not held behind 8-bit steps), and stored as the 1x1 texel depth fog
+// and the haze band read. No texel in the band holds the colour; no colour yet, or a reset (band.w 2, a scene load)
+// with nothing on screen, starts it at the scene's. A plain snap (band.w 1) only drops the smoothing.
 static const char* kSkyColourCsSource = R"(
 cbuffer SkyColourCB : register(b0) {
     float4 horizon;   // a, b, c over render-target pixels (above > 0), and |(a, b)|
-    int4 viewport;    // x0, y0, x1, y1 in copy texels
+    int4 viewport;    // x0, y0, x1, y1 in copy texels: what the sky drew (SkyFogParams::drawn)
     int4 dims;        // the copy's origin in the render target (x, y), pass 1's group count, the most rows a column
                       // reads
     float4 band;      // loPx, hiPx, k, snap

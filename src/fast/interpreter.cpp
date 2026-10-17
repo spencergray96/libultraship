@@ -1856,7 +1856,10 @@ void SkyFogRequestDump(const std::string& prefix) {
 // copyFb runs the reduction (Interpreter::ReduceSkyColour).
 static SkyColourStatus sSkyColour = {};
 static bool sSkyColourSnap = true;
-static bool sSkyColourReset = true; // SkyColourReset (sturdy-bassoon#241); the first reduction has no history either
+// SkyColourReset (sturdy-bassoon#241): the next reduction is a snap that starts from sceneFog with nothing on screen.
+// It waits for a reduction, so one asked for while the colour is off or the copy is held lands on the first after.
+static bool sSkyColourReset = true;
+constexpr uint32_t kSkyColourSnapReset = 2; // SkyColourParams::snap: 1 a plain snap, 2 a reset
 static FILE* sSkyColourLog = nullptr;
 
 void SkyColourSet(const SkyColourSettings& settings) {
@@ -6085,8 +6088,10 @@ void Interpreter::ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, 
     const float scTop = targetHeight - sc.y - (float)sc.height;
     const float drawn[4] = { std::max((float)vp.x, (float)sc.x), std::max(vpTop, scTop),
                              std::min(vp.x + vw, (float)sc.x + sc.width), std::min(vpTop + vh, scTop + sc.height) };
+    // The low corner stays a texel of the copy even when the rectangle is empty (a scissor off the copy, a letterbox
+    // shut), so SkyFogColor's clamp never reads past it; empty, the reduction reads nothing and holds.
     for (int i = 0; i < 2; i++) {
-        params.drawn[i] = std::clamp((int)lroundf(drawn[i]) - params.origin[i], 0, params.size[i]);
+        params.drawn[i] = std::clamp((int)lroundf(drawn[i]) - params.origin[i], 0, std::max(params.size[i] - 1, 0));
         params.drawn[2 + i] = std::clamp((int)lroundf(drawn[2 + i]) - params.origin[i], params.drawn[i], params.size[i]);
     }
 
@@ -6216,7 +6221,7 @@ void Interpreter::ReduceSkyColour(const SkyFogParams& params, float pxPerTan) {
     const bool snap = sSkyColourSnap || sSkyColour.reductions == 0 || sSkyColour.lastRun + 1 != sSkyFog.runs ||
                       r.size[0] != sSkyColour.last.size[0] || r.size[1] != sSkyColour.last.size[1];
     const float dt = snap ? 0.0f : (float)std::clamp(now - mSkyColourLastTime, 0.0, 0.1);
-    r.snap = snap ? (sSkyColourReset ? 2 : 1) : 0;
+    r.snap = snap ? (sSkyColourReset ? kSkyColourSnapReset : 1) : 0;
     r.k = snap || c.tau <= 0.0f ? 1.0f : 1.0f - expf(-dt / c.tau);
     mRapi->ReduceSkyColour(r);
 
