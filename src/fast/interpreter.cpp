@@ -1856,6 +1856,7 @@ void SkyFogRequestDump(const std::string& prefix) {
 // copyFb runs the reduction (Interpreter::ReduceSkyColour).
 static SkyColourStatus sSkyColour = {};
 static bool sSkyColourSnap = true;
+static bool sSkyColourReset = true; // SkyColourReset (sturdy-bassoon#241); the first reduction has no history either
 static FILE* sSkyColourLog = nullptr;
 
 void SkyColourSet(const SkyColourSettings& settings) {
@@ -1872,6 +1873,11 @@ bool SkyColourSupported() {
 
 void SkyColourSnap() {
     sSkyColourSnap = true;
+}
+
+void SkyColourReset() {
+    sSkyColourSnap = true;
+    sSkyColourReset = true;
 }
 
 void SkyColourRequestReadout() {
@@ -6069,18 +6075,31 @@ void Interpreter::ArmSkyFog(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, 
     params.horizon[1] = -2.0f * l[1] / vh;
     params.horizon[2] = l[0] * (-2.0f * vp.x / vw - 1.0f) + l[1] * (2.0f * (targetHeight - vp.y) / vh - 1.0f) + l[2];
 
+    // What the sky drew (sturdy-bassoon#241): the 3D viewport cut to the scissor in force now. Both are kept bottom-up
+    // in render-target pixels (AdjustVIewportOrScissor) and flipped the same way by the backend, so both are flipped
+    // here as the line is. A letterbox (View_ApplyLetterbox: the bow's aim, cutscenes, talking) scissors its bars out
+    // of the skybox, which leaves the frame's clear colour - black - in the copy there; averaged into the band, a band
+    // in the top bar turned the fog black and then held it.
+    const XYWidthHeight& sc = mRdp->scissor;
+    const float vpTop = targetHeight - vp.y - vh;
+    const float scTop = targetHeight - sc.y - (float)sc.height;
+    const float drawn[4] = { std::max((float)vp.x, (float)sc.x), std::max(vpTop, scTop),
+                             std::min(vp.x + vw, (float)sc.x + sc.width), std::min(vpTop + vh, scTop + sc.height) };
+    for (int i = 0; i < 2; i++) {
+        params.drawn[i] = std::clamp((int)lroundf(drawn[i]) - params.origin[i], 0, params.size[i]);
+        params.drawn[2 + i] = std::clamp((int)lroundf(drawn[2 + i]) - params.origin[i], params.drawn[i], params.size[i]);
+    }
+
     // The sky's colour (sturdy-bassoon#229): the reduction, before anything after the copy reads it. Its band is in
     // degrees, turned into pixels with the focal length: cot(fovy / 2) is the ratio of the lengths of P's y and w
     // columns over its direction rows (the viewing matrix is a rotation, and the projection's scale cancels), so a
     // degree is (vh / 2) cot(fovy / 2) tan(1 degree) pixels - exact for a level camera at the centre, near enough
-    // across a band that is averaged. The viewport is the 3D one, in render-target pixels as the line is.
+    // across a band that is averaged. It reads only the texels the sky drew (params.drawn).
     FillSkyColour(params, true);
     if (params.colourOn != 0) {
         const float py = sqrtf(p[0][1] * p[0][1] + p[1][1] * p[1][1] + p[2][1] * p[2][1]);
         const float pw = sqrtf(p[0][3] * p[0][3] + p[1][3] * p[1][3] + p[2][3] * p[2][3]);
-        const float top = targetHeight - vp.y - vh;
-        const float viewport[4] = { (float)vp.x, top, vp.x + vw, top + vh };
-        ReduceSkyColour(params, viewport, pw > 0.0f ? 0.5f * vh * py / pw : 0.0f);
+        ReduceSkyColour(params, pw > 0.0f ? 0.5f * vh * py / pw : 0.0f);
     }
 
     mSkyFogParams = params;
@@ -6168,11 +6187,12 @@ void Interpreter::FillSkyColour(SkyFogParams& params, bool reducing) {
     }
 }
 
-// The reduction for this copy: the band in pixels, the viewport in the copy's texels, and the smoothing step. It snaps
-// - this frame's average, no history - on the first one, after a rendered frame without one (a scene load, the pause
-// menu, a hold), when the copy's size changes, or when asked. Otherwise k = 1 - exp(-dt / tau), dt the time since the
-// last one (at most 0.1 s), so the colour settles at the same rate at any frame rate.
-void Interpreter::ReduceSkyColour(const SkyFogParams& params, const float viewport[4], float pxPerTan) {
+// The reduction for this copy: the band in pixels, the texels the sky drew, and the smoothing step. It snaps - this
+// frame's average, no history - on the first one, after a rendered frame without one (a scene load, the pause menu, a
+// hold), when the copy's size changes, or when asked. Otherwise k = 1 - exp(-dt / tau), dt the time since the last one
+// (at most 0.1 s), so the colour settles at the same rate at any frame rate. A reset (SkyColourReset) is a snap that
+// starts from the scene's fog colour when none of the band is on screen.
+void Interpreter::ReduceSkyColour(const SkyFogParams& params, float pxPerTan) {
     const SkyColourSettings& c = sSkyColour.settings;
     constexpr float kRadians = 3.14159265358979f / 180.0f;
     SkyColourParams r;
@@ -6181,8 +6201,9 @@ void Interpreter::ReduceSkyColour(const SkyFogParams& params, const float viewpo
     for (int i = 0; i < 2; i++) {
         r.origin[i] = params.origin[i];
         r.size[i] = params.size[i];
-        r.viewport[i] = std::clamp((int)lroundf(viewport[i]) - params.origin[i], 0, params.size[i]);
-        r.viewport[2 + i] = std::clamp((int)lroundf(viewport[2 + i]) - params.origin[i], 0, params.size[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        r.viewport[i] = params.drawn[i];
     }
     for (int i = 0; i < 3; i++) {
         r.horizon[i] = params.horizon[i];
@@ -6195,11 +6216,12 @@ void Interpreter::ReduceSkyColour(const SkyFogParams& params, const float viewpo
     const bool snap = sSkyColourSnap || sSkyColour.reductions == 0 || sSkyColour.lastRun + 1 != sSkyFog.runs ||
                       r.size[0] != sSkyColour.last.size[0] || r.size[1] != sSkyColour.last.size[1];
     const float dt = snap ? 0.0f : (float)std::clamp(now - mSkyColourLastTime, 0.0, 0.1);
-    r.snap = snap ? 1 : 0;
+    r.snap = snap ? (sSkyColourReset ? 2 : 1) : 0;
     r.k = snap || c.tau <= 0.0f ? 1.0f : 1.0f - expf(-dt / c.tau);
     mRapi->ReduceSkyColour(r);
 
     sSkyColourSnap = false;
+    sSkyColourReset = false;
     mSkyColourLastTime = now;
     sSkyColour.reductions++;
     sSkyColour.lastRun = sSkyFog.runs;

@@ -1933,6 +1933,9 @@ void GfxRenderingAPIDX11::SetSkyFog(const SkyFogParams& params) {
         mPerFrameCbData.sky_horizon[i] = params.horizon[i];
     }
     mPerFrameCbData.sky_horizon[3] = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        mPerFrameCbData.sky_drawn[i] = params.drawn[i]; // sturdy-bassoon#241
+    }
 
     // The sky's colour (sturdy-bassoon#229): the 1x1 framebuffer the reduction wrote, on a slot of its own.
     ID3D11ShaderResourceView* colourView = nullptr;
@@ -2025,9 +2028,9 @@ void ResolveMain(uint3 tid : SV_GroupThreadID) {
     if (tid.x == 0) {
         float4 sum = gs[0];
         float4 prev = state[0];
-        // Nothing on screen holds the colour there is; only with none yet does it start at the scene's. A snap only
-        // drops the smoothing.
-        float3 raw = sum.w > 0.0 ? sum.rgb / sum.w : (prev.w == 0.0 ? sceneFog.rgb : prev.rgb);
+        // Nothing on screen holds the colour there is; only with none yet, or on a reset (band.w 2: a scene load,
+        // sturdy-bassoon#241), does it start at the scene's. A snap only drops the smoothing.
+        float3 raw = sum.w > 0.0 ? sum.rgb / sum.w : (prev.w == 0.0 || band.w > 1.5 ? sceneFog.rgb : prev.rgb);
         float k = prev.w == 0.0 || band.w != 0.0 ? 1.0 : band.z;
         float3 colour = sum.w > 0.0 ? lerp(prev.rgb, raw, k) : raw;
         state[0] = float4(colour, 1.0);
@@ -2148,7 +2151,7 @@ void GfxRenderingAPIDX11::ReduceSkyColour(const SkyColourParams& params) {
     cb = { { params.horizon[0], params.horizon[1], params.horizon[2], n },
            { params.viewport[0], params.viewport[1], params.viewport[2], params.viewport[3] },
            { params.origin[0], params.origin[1], groups, kSkyColourMaxRows },
-           { params.loPx, params.hiPx, params.k, params.snap != 0 ? 1.0f : 0.0f },
+           { params.loPx, params.hiPx, params.k, (float)params.snap },
            { params.sceneFog[0] / 255.0f, params.sceneFog[1] / 255.0f, params.sceneFog[2] / 255.0f, 0.0f } };
     D3D11_MAPPED_SUBRESOURCE ms;
     if (FAILED(mContext->Map(mSkyColourCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {

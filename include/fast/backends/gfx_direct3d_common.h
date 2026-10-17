@@ -30,8 +30,10 @@ struct PerFrameCB {
     uint32_t sky_colour_mode = 0;
     uint32_t sky_padding = 0;
     float sky_scene_fog[4] = {};
+    // The copy texels the sky drew (sturdy-bassoon#241; SkyFogParams::drawn), appended in a register of its own.
+    int32_t sky_drawn[4] = {};
 };
-static_assert(sizeof(PerFrameCB) == 80, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
+static_assert(sizeof(PerFrameCB) == 96, "PerFrameCB must match the HLSL cbuffer's 16-byte registers");
 
 struct PerDrawCB {
     struct Texture {

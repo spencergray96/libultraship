@@ -451,7 +451,7 @@ class Interpreter {
     SkyFogParams mSkyFogParams;
     // The sky's colour (sturdy-bassoon#229; SkyColourSet below): the reduction at the copy, and what it last ran with.
     void FillSkyColour(SkyFogParams& params, bool reducing);
-    void ReduceSkyColour(const SkyFogParams& params, const float viewport[4], float pxPerTan);
+    void ReduceSkyColour(const SkyFogParams& params, float pxPerTan);
     void FinishSkyColour();
     double mSkyColourLastTime = 0.0;
     void ResetFrameBuffer();
@@ -736,6 +736,10 @@ void SkyColourSet(const SkyColourSettings& settings);
 bool SkyColourSupported();
 // The next reduction starts again from that frame's average, as after a frame without a copy.
 void SkyColourSnap();
+// A snap that, with nothing of the band on screen, starts from the scene's fog colour rather than holding the last one:
+// for a scene load, so a scene whose first frames are letterboxed or look down never starts from another scene's
+// colour (sturdy-bassoon#241). Pause, `fog sky hold` and a resize snap without it and keep holding.
+void SkyColourReset();
 // Debug readbacks: the last reduction read back at the end of the next rendered frame that ran one (status), and
 // a log of every reduction's result, one line a rendered frame, through a staging ring that never waits for the GPU
 // (path empty stops it). False when the file cannot be opened.

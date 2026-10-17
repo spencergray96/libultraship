@@ -85,6 +85,9 @@ cbuffer PerFrameCB : register(b0) {
     // a draw's fog colour must be for it to. Its own register, as in PerFrameCB.
     uint sky_colour_mode;
     float4 sky_scene_fog;
+    // The copy texels the sky drew (sturdy-bassoon#241), appended: x0, y0, x1, y1. Outside them a letterbox's bars
+    // left the frame's clear colour.
+    int4 sky_drawn;
 }
 
 @if(o_fog)
@@ -95,13 +98,15 @@ Texture2D g_skyColour : register(t7);
 
 // Sky-colour fog (sturdy-bassoon#226): the sky copy's colour under render-target pixel pos - the frame as it was
 // just before the rooms drew. Mirror reads it as it is; clamp reads a pixel below the horizon from two pixels above
-// the horizon in the same column, so fogged ground takes the horizon's colour, not the skybox's mirrored sky.
+// the horizon in the same column, so fogged ground takes the horizon's colour, not the skybox's mirrored sky. Either
+// reads only texels the sky drew (sturdy-bassoon#241): with the horizon inside a letterbox's bar, clamp's row is the
+// nearest drawn one, not the bar's black.
 float3 SkyFogColor(float2 pos) {
     float2 p = pos;
     if (sky_fog_mode == 2 && dot(sky_horizon.xyz, float3(pos, 1.0)) < 0.0 && abs(sky_horizon.y) > 1e-6) {
         p.y = -(sky_horizon.x * pos.x + sky_horizon.z) / sky_horizon.y + 2.0 * sign(sky_horizon.y);
     }
-    int2 t = clamp(int2(floor(p)) - sky_origin, int2(0, 0), sky_size - int2(1, 1));
+    int2 t = clamp(int2(floor(p)) - sky_origin, sky_drawn.xy, max(sky_drawn.zw - int2(1, 1), sky_drawn.xy));
     return g_skyCopy.Load(int3(t, 0)).rgb;
 }
 @end

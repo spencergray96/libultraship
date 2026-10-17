@@ -69,6 +69,10 @@ struct SkyFogParams {
     int colourFbId = -1;
     uint32_t colourOn = 0;
     float sceneFog[3] = {};
+    // The copy texels the sky drew (sturdy-bassoon#241), appended: x0, y0, x1, y1, the 3D viewport cut to the scissor
+    // in force at the copy. A letterbox (View_ApplyLetterbox: aiming, cutscenes, talking) scissors its bars out of the
+    // skybox, so outside this the copy holds the frame's clear colour, not the sky.
+    int32_t drawn[4] = {};
 };
 
 // The sky's colour (sturdy-bassoon#229; interpreter.h SkyColourSet): the pixel shader's slot for the 1x1 framebuffer
@@ -76,19 +80,21 @@ struct SkyFogParams {
 constexpr uint32_t SKY_COLOUR_TEXTURE_SLOT = 7;
 
 // What the reduction reads, from the interpreter at the copy (Interpreter::ArmSkyFog): every copy texel whose centre
-// lies loPx..hiPx above the horizon line (perpendicular to it), inside the 3D viewport, averaged, then smoothed toward
-// by k (1 snaps). With no texel on screen the colour holds; with no colour yet it is sceneFog.
+// lies loPx..hiPx above the horizon line (perpendicular to it), inside the texels the sky drew, averaged, then smoothed
+// toward by k (1 snaps). With no such texel the colour holds; with no colour yet, or after a reset, it is sceneFog.
 struct SkyColourParams {
     int copyFbId = -1;
     int colourFbId = -1;
     int32_t origin[2] = {};    // the render-target pixel the copy's texel (0, 0) came from
     int32_t size[2] = {};      // the copy's size in texels
-    int32_t viewport[4] = {};  // x0, y0, x1, y1: the 3D viewport in copy texels, clipped to the copy
+    int32_t viewport[4] = {};  // x0, y0, x1, y1: the copy texels the sky drew (SkyFogParams::drawn)
     float horizon[3] = {};     // as SkyFogParams::horizon
     float loPx = 0.0f;
     float hiPx = 0.0f;
     float k = 1.0f;
-    uint32_t snap = 0;         // forget the history: start again from this frame (or sceneFog with nothing on screen)
+    // Forget the history: 1 starts again from this frame, holding the last colour with nothing on screen; 2 (a scene
+    // load, SkyColourReset - sturdy-bassoon#241) starts from sceneFog instead when nothing is on screen.
+    uint32_t snap = 0;
     float sceneFog[3] = {};    // 0..255
 };
 
