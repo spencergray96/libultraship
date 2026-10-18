@@ -1032,8 +1032,9 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //   * lights each colour input in shadeMask (the SHADE inputs) from the normal a lit vertex was
 //     recorded with, under the current lights - which is why light changes need no rebake either.
 //     Only a vertex flagged lit in position.w is lit; an unlit one keeps its recorded colour;
-//   * adds the draw's scroll offset to TEXEL0's texture coordinate (sturdy-bassoon#187 A1), from the
-//     second buffer, StaticBakeAnimCB. A still draw's offset is 0;
+//   * adds the draw's scroll offset to TEXEL0's texture coordinate (sturdy-bassoon#187 A1), and to
+//     TEXEL1's in a program that samples it (#231, the second layer), from the second buffer,
+//     StaticBakeAnimCB: xy and zw. A still draw's offset is 0;
 //   * bends a vertex that carries a wind code in position.w, from the same buffer (wind in the
 //     replay, #209 W1): along uWindB, or along its own direction at uWindB's length. A vertex
 //     recorded without wind (w = 1 or 2) is not touched;
@@ -1041,10 +1042,11 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 //     buffer (the wobble, sturdy-bassoon#216 W): result.inputN.a times StaticBakeWobble's factor. Only
 //     a program with alpha has alpha inputs to fade. A vertex recorded without one is not touched.
 static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMask, bool samplesTexel0,
-                                  bool hasAlpha, int numInputs, bool edgeTwin) {
+                                  bool samplesTexel1, bool hasAlpha, int numInputs, bool edgeTwin) {
     static const char* kPosMarker = "result.position = position;";
     static const char* kFogMarker = "result.fog = fog;";
     static const char* kUv0Marker = "result.uv0 = uv0;";
+    static const char* kUv1Marker = "result.uv1 = uv1;";
     // The edge twin (sturdy-bassoon#230): the source is the FOG_EDGE program's, whose pixel stage reads fogEdge; the
     // recorded stream has no such float, so its vertex input goes and the vertex stage computes it instead.
     static const char* kFogEdgeInput = ", float fogEdge : FOGEDGE";
@@ -1064,6 +1066,9 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     // A program that samples TEXEL0 has to have its pass-through line, or a scrolling draw would
     // replay still while the interpreter scrolls it.
     if (samplesTexel0 && src.find(kUv0Marker) == std::string::npos) {
+        return false;
+    }
+    if (samplesTexel1 && src.find(kUv1Marker) == std::string::npos) {
         return false;
     }
 
@@ -1101,7 +1106,7 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
     cb += "cbuffer StaticBakeAnimCB : register(b";
     cb += std::to_string(STATIC_BAKE_ANIM_CB_SLOT);
     cb += ") {\n"
-          "    float4 uUvOffset;\n" // xy TEXEL0's scroll offset; zw TEXEL1's, reserved for #201
+          "    float4 uUvOffset;\n" // xy TEXEL0's scroll offset; zw TEXEL1's (#231)
           "    float4 uWindK;\n"    // wave vector (xyz), phase now (w); #209 W1
           "    float4 uWindB;\n"    // bend at weight 1 along the wind (xyz), ripple (w); #209 W1
           "    float4 uWobble;\n"   // cycle now (x), strength (y); #216 W
@@ -1200,6 +1205,15 @@ static bool StaticBakePatchSource(std::string& src, bool hasFog, uint8_t shadeMa
             return false;
         }
         src.replace(uvAt, strlen(kUv0Marker), "result.uv0 = uv0 + uUvOffset.xy;");
+    }
+    // And TEXEL1's (#231): the second layer of a two-layer material, at its own rate. A draw whose TEXEL1
+    // holds still has zw 0, which leaves the coordinate as it was.
+    if (samplesTexel1) {
+        const size_t uvAt = src.find(kUv1Marker, vsAt + cb.size());
+        if (uvAt == std::string::npos) {
+            return false;
+        }
+        src.replace(uvAt, strlen(kUv1Marker), "result.uv1 = uv1 + uUvOffset.zw;");
     }
 
     // The bend (wind in the replay, #209 W1): a vertex whose recorded w carries a wind code moves by a
@@ -1316,7 +1330,7 @@ struct ShaderProgramD3D11* GfxRenderingAPIDX11::LookupOrCreateStaticShader(struc
         return nullptr;
     }
     if (!StaticBakePatchSource(source, cc_features.opt_fog, shadeMask, cc_features.usedTextures[0],
-                               cc_features.opt_alpha, cc_features.numInputs, edgeTwin)) {
+                               cc_features.usedTextures[1], cc_features.opt_alpha, cc_features.numInputs, edgeTwin)) {
         // Dump the vertex stage as generated, so a template change that moves the markers is one
         // log read to diagnose rather than a rebuild.
         const size_t at = source.find("VSMain");

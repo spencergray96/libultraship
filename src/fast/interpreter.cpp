@@ -2619,18 +2619,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         StaticBakeNoteMaterial(this, bake_material);
     }
 
-    // A scrolling TEXEL0 (sturdy-bassoon#187 A1), drawn interpreted: the same offset the replay's vertex
-    // stage adds, added to the same tile-normalised coordinate, so the picture is the same either way.
-    // A record pass keeps the raw coordinates (the replay adds it), and a texture rectangle never
-    // scrolls. The gate is one bool while nothing is bound.
-    float scrollOffset[2];
-    const bool scrollsTexel0 =
-        gStaticBakeScrollsBound && !bakeRecording && !is_rect && comb->usedTextures[0] && usedTextures[0] &&
-        mRenderingState.mTextures[0] != nullptr &&
-        StaticBakeTextureScrollOffset(mRenderingState.mTextures[0]->first.texture_addr, scrollOffset);
+    // A scrolling TEXEL0 (sturdy-bassoon#187 A1), or TEXEL1 (#231, the second layer), drawn interpreted:
+    // the same offset the replay's vertex stage adds, added to the same tile-normalised coordinate, so
+    // the picture is the same either way. A record pass keeps the raw coordinates (the replay adds it),
+    // and a texture rectangle never scrolls. The gate is one bool while nothing is bound.
+    float scrollOffset[2][2];
+    bool scrollsTexel[2] = { false, false };
+    if (gStaticBakeScrollsBound && !bakeRecording && !is_rect) {
+        for (int t = 0; t < 2; t++) {
+            scrollsTexel[t] = comb->usedTextures[t] && usedTextures[t] && mRenderingState.mTextures[t] != nullptr &&
+                              StaticBakeTextureScrollOffset(mRenderingState.mTextures[t]->first.texture_addr, t,
+                                                            scrollOffset[t]);
+        }
+    }
 #else
-    constexpr bool scrollsTexel0 = false;
-    const float scrollOffset[2] = { 0.0f, 0.0f };
+    constexpr bool scrollsTexel[2] = { false, false };
+    const float scrollOffset[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
 #endif
 
     for (int i = 0; i < 3; i++) {
@@ -2696,9 +2700,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
             // Two arms rather than one write with a 0 offset, so a still texture's coordinates are
             // exactly what they were before scrolls existed (adding 0.0f would turn -0 into +0).
-            if (t == 0 && scrollsTexel0) {
-                mBufVbo[mBufVboLen++] = u / tex_width[t] + scrollOffset[0];
-                mBufVbo[mBufVboLen++] = v / tex_height[t] + scrollOffset[1];
+            if (scrollsTexel[t]) {
+                mBufVbo[mBufVboLen++] = u / tex_width[t] + scrollOffset[t][0];
+                mBufVbo[mBufVboLen++] = v / tex_height[t] + scrollOffset[t][1];
             } else {
                 mBufVbo[mBufVboLen++] = u / tex_width[t];
                 mBufVbo[mBufVboLen++] = v / tex_height[t];

@@ -106,8 +106,7 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 // One registered display list, for a host that reports on the lists it offered by name
 // (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
 // and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them whose TEXEL0
-// was recorded with a scroll rate, the draws that move (#187 A1; a rate on TEXEL1 alone is stamped but
-// not applied, so not counted). `windVertices` and `windTris` (#209 W1): the weighted vertices its
+// or TEXEL1 was recorded with a scroll rate, the draws that move (#187 A1; TEXEL1's since #231). `windVertices` and `windTris` (#209 W1): the weighted vertices its
 // recording loaded, and the triangles with at least one weighted corner, the part that sways.
 // `wobbleVertices` and `wobbleTris` (#216 W): the same for wobble vertices, the part that fades.
 // `wobbleDepths` (#222): bit d set for each depth d (0-63) a recorded wobble corner carries.
@@ -144,6 +143,14 @@ std::vector<StaticBakeKeyedEntry> StaticBakeGetScrollingEntries();
 // wherever it is drawn as TEXEL0, baked or interpreted: RS's texture animation, which belongs to the
 // texture, not to the model that uses it. Texture rectangles never scroll.
 //
+// THE TILE (sturdy-bassoon#231): a rate is keyed by the path AND the combiner slot it is sampled
+// through, tile 0 for TEXEL0 and tile 1 for TEXEL1 - vanilla's render tile and the one after it, which
+// is what an OoT two-layer material names them. Vanilla's calm water draws one image as both, each
+// scrolling its own way, so one path carries up to two rates, one per tile. A slot, not a material:
+// the recorder and the interpreter see the bound image per slot per triangle, never which material set
+// it. The three-argument StaticBakeSetTextureScroll is tile 0, exactly as before tiles existed; a path
+// with no tile-1 rate leaves TEXEL1's coordinate as it was, wherever that image is drawn there.
+//
 // LIFETIME: the registry belongs to the process, not to a scene, a bake group or a recording. A
 // registration survives StaticBakeReset (a scene or bake-group change, `staticbake reset`),
 // StaticBakeInvalidateAll (`staticbake rebake`, the alt-assets toggle, a filter change) and every
@@ -166,8 +173,8 @@ std::vector<StaticBakeKeyedEntry> StaticBakeGetScrollingEntries();
 // RECORD TIME: a baked draw carries the rate the registry gave its texture WHEN IT WAS RECORDED. So
 // register before the list first draws; a change to a path an existing bake already recorded shows
 // on baked draws only after StaticBakeInvalidateAll (`staticbake rebake`), while interpreted draws
-// follow at once. The recorder closes a batch where TEXEL0's rate changes, so a scrolling material is
-// a draw of its own; a list with no scrolling texture records exactly as before.
+// follow at once. The recorder closes a batch where either slot's rate changes, so a scrolling material
+// is a draw of its own; a list with no scrolling texture records exactly as before.
 // ---------------------------------------------------------------------------
 
 // Register, change or remove one texture's scroll: `path` as an archive list names it (with or without
@@ -177,15 +184,21 @@ std::vector<StaticBakeKeyedEntry> StaticBakeGetScrollingEntries();
 // registry changed: a rate added, changed or removed - the case where a bake recorded under the old
 // rate needs StaticBakeInvalidateAll. Rates must be finite; a non-finite rate is refused (false).
 bool StaticBakeSetTextureScroll(const char* path, float du, float dv);
+// The same for one tile (#231): 0 is TEXEL0's rate, the call above; 1 is TEXEL1's. Each tile's rate is
+// set, changed and removed on its own, and the path stays registered while either tile has one. Any
+// other tile is refused (false).
+bool StaticBakeSetTextureScroll(const char* path, int tile, float du, float dv);
+constexpr int STATIC_BAKE_SCROLL_TILES = 2;
 // Remove every registration (the console's `staticbake scroll clear`). Same record-time rule.
 void StaticBakeClearTextureScrolls();
-// The registrations, in no particular order. `bound`: the path has resolved to image data since it
-// was registered, so draws of it scroll.
+// The registrations, in no particular order, one per path and tile with a rate. `bound`: the path has
+// resolved to image data since it was registered, so draws of it scroll.
 struct StaticBakeTextureScroll {
     std::string path;
     float du = 0.0f;
     float dv = 0.0f;
     bool bound = false;
+    int tile = 0;
 };
 std::vector<StaticBakeTextureScroll> StaticBakeGetTextureScrolls();
 
@@ -490,9 +503,10 @@ void StaticBakeBeginFrame();
 // the binding (letting the old resource go) when the path now resolves somewhere else. No-op for an
 // unregistered path, and while nothing is registered.
 void StaticBakeNoteTexture(const char* path, const void* imageData, const std::shared_ptr<Texture>& owner);
-// The offset to add now, in texture widths and heights, to the coordinates of a triangle whose TEXEL0
-// is the image data at `imageData`; false (and `out` untouched) when that texture does not scroll.
-bool StaticBakeTextureScrollOffset(const void* imageData, float out[2]);
+// The offset to add now, in texture widths and heights, to the coordinates of a triangle whose slot
+// `tile` (0 TEXEL0, 1 TEXEL1; #231) is the image data at `imageData`; false (and `out` untouched) when
+// that texture does not scroll on that tile.
+bool StaticBakeTextureScrollOffset(const void* imageData, int tile, float out[2]);
 
 // Wind, the interpreter's side (#209 W1).
 //

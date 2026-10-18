@@ -167,7 +167,7 @@ static_assert(sizeof(StaticBakeUniforms) % 16 == 0, "StaticBakeCB is a whole num
 // Mirrored member for member by the HLSL cbuffer StaticBakeAnimCB in StaticBakePatchSource.
 struct StaticBakeAnimUniforms {
     // Per draw. xy: the offset added to TEXEL0's texture coordinate, frac(rate x clock), in texture
-    // widths and heights. zw: TEXEL1's, reserved for several textures a prop (#201); 0 until then.
+    // widths and heights. zw: TEXEL1's (#231, the second layer of a two-layer material); 0 where it holds still.
     float uvOffset[4];
     // Per list entry, wind in the replay (#209 W1; StaticBakeWindVectors). windK: xyz the wave vector
     // in the list's own space, w the phase now. windB: xyz the bend at weight 1 along the wind in the
