@@ -2623,10 +2623,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // the same offset the replay's vertex stage adds, added to the same tile-normalised coordinate, so
     // the picture is the same either way. A record pass keeps the raw coordinates (the replay adds it),
     // and a texture rectangle never scrolls. The gate is one bool while nothing is bound.
-    float scrollOffset[2][2];
-    bool scrollsTexel[2] = { false, false };
+    float scrollOffset[STATIC_BAKE_SCROLL_TILES][2];
+    bool scrollsTexel[STATIC_BAKE_SCROLL_TILES] = { false, false };
     if (gStaticBakeScrollsBound && !bakeRecording && !is_rect) {
-        for (int t = 0; t < 2; t++) {
+        for (int t = 0; t < STATIC_BAKE_SCROLL_TILES; t++) {
             scrollsTexel[t] = comb->usedTextures[t] && usedTextures[t] && mRenderingState.mTextures[t] != nullptr &&
                               StaticBakeTextureScrollOffset(mRenderingState.mTextures[t]->first.texture_addr, t,
                                                             scrollOffset[t]);

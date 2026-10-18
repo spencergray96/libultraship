@@ -106,8 +106,9 @@ void StaticBakeGetStats(uint32_t* registered, uint32_t* baked, uint32_t* rejecte
 // One registered display list, for a host that reports on the lists it offered by name
 // (sturdy-bassoon#171: the archive prop lists). `draws` and `tris` are the baked entry's replay draws
 // and triangles, 0 unless Baked; `scrollingDraws` and `scrollingTris` the part of them whose TEXEL0
-// or TEXEL1 was recorded with a scroll rate, the draws that move (#187 A1; TEXEL1's since #231). `windVertices` and `windTris` (#209 W1): the weighted vertices its
-// recording loaded, and the triangles with at least one weighted corner, the part that sways.
+// or TEXEL1 was recorded with a scroll rate, the draws that move (#187 A1; TEXEL1's since #231).
+// `windVertices` and `windTris` (#209 W1): the weighted vertices its recording loaded, and the
+// triangles with at least one weighted corner, the part that sways.
 // `wobbleVertices` and `wobbleTris` (#216 W): the same for wobble vertices, the part that fades.
 // `wobbleDepths` (#222): bit d set for each depth d (0-63) a recorded wobble corner carries.
 // `rejectReason` is a string literal naming why the recorder refused it, nullptr unless Rejected.
