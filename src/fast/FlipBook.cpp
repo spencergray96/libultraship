@@ -35,7 +35,7 @@ struct Trace {
 } sTrace;
 
 bool Valid(const FlipBookDesc& d) {
-    if (d.poseCount < 1 || d.poseCount > FLIPBOOK_POSES_MAX) {
+    if (d.poseCount < 1 || d.poses.size() != (size_t)d.poseCount + 1 || d.cycles.size() != (size_t)d.poseCount) {
         return false;
     }
     for (int32_t k = 0; k < d.poseCount; k++) {

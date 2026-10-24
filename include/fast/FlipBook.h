@@ -39,24 +39,28 @@
 // lists it registered with the bake when it took hold of them (ArchiveProps does), and the bake forgets
 // them only at StaticBakeReset, just before the host lets them go - so a pose pointer that outlived its
 // resource reads unheld. Release builds skip the lookup.
+//
+// SIZE (sturdy-bassoon#204, in-between poses): a flip holds as many poses as its owner gives it, each flip its
+// own (a tweened torch 9, a stepped one 2), so a short loop never pays for a long one. There is no fixed cap
+// here; the host's table bounds its own (ArchivePropLists.h, ARCHIVE_PROPS_ANIM_POSES_MAX).
 
 namespace Fast {
 
-constexpr int FLIPBOOK_POSES_MAX = 16;
 constexpr double FLIPBOOK_CYCLES_PER_SECOND = 50.0; // RS's client cycle, 20 ms
 
 struct FlipBookDesc {
-    // poses[k] for k < poseCount, then rest at poses[poseCount]. NULL draws nothing for that pose.
-    const void* poses[FLIPBOOK_POSES_MAX + 1] = {};
-    int32_t cycles[FLIPBOOK_POSES_MAX] = {}; // each pose's length in client cycles, >= 1
-    int32_t poseCount = 0;                   // 1..FLIPBOOK_POSES_MAX
-    int32_t frameStep = 0;                   // RS's: 1..poseCount loops; anything else plays once
-    int64_t cycleOffset = 0;                 // added to the clock's cycles: a loop's random start
-    double origin = 0.0;                     // clock seconds the play counts from
+    // poses[k] for k < poseCount, then rest at poses[poseCount]: poseCount + 1 of them. NULL draws nothing.
+    std::vector<const void*> poses;
+    std::vector<int32_t> cycles; // each pose's length in client cycles, >= 1: poseCount of them
+    int32_t poseCount = 0;       // 1 or more
+    int32_t frameStep = 0;       // RS's: 1..poseCount loops; anything else plays once
+    int64_t cycleOffset = 0;     // added to the clock's cycles: a loop's random start
+    double origin = 0.0;         // clock seconds the play counts from
 };
 
 // Register (or replace) the flip at `handle`; returns its serial, never 0. 0 when the description does not
-// read (no handle, a pose count out of range, a length below 1): nothing is registered.
+// read (no handle, no pose, `poses` or `cycles` not poseCount + 1 and poseCount long, a length below 1):
+// nothing is registered.
 uint16_t FlipBookRegister(const void* handle, const FlipBookDesc& desc);
 // A play-once flip's start, once its owner knows it. No-op for an unknown handle.
 void FlipBookSetOrigin(const void* handle, double origin);
