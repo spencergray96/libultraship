@@ -34,6 +34,7 @@
 #include "fast/PerfCounters.h"
 #include "fast/StaticMeshCache.h"
 #include "fast/TextureMips.h"
+#include "fast/FlipBook.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -4321,6 +4322,24 @@ bool gfx_modify_vtx_handler_f3dex2(F3DGfx** cmd0) {
 }
 
 // F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
+// A pushed call into subGFX: what a G_DL does, and what a flip head does with the pose it picked.
+static void gfx_call_display_list(Interpreter* gfx, F3DGfx** cmd0, F3DGfx* subGFX) {
+#ifdef ENABLE_STATIC_BAKE
+    // A registered static mesh either replays from its GPU buffer (and the walk below is
+    // skipped entirely) or is about to be recorded by that same walk.
+    if (StaticBakeIntercept(gfx, subGFX)) {
+        return;
+    }
+#endif
+    // Entering a list the host named for mipmaps (sturdy-bassoon#146): everything it and its
+    // callees load is in scope until the stack drops back below this depth. A baked list that
+    // replays never gets here, and needs nothing: its draws hold the textures it recorded.
+    if (sMipScopeDepth == 0 && !sMipScopeLists.empty() && sMipScopeLists.contains(subGFX)) {
+        sMipScopeDepth = g_exec_stack.cmd_stack.size() + 1;
+    }
+    g_exec_stack.call(*cmd0, subGFX);
+}
+
 bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4328,20 +4347,10 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
-#ifdef ENABLE_STATIC_BAKE
-            // A registered static mesh either replays from its GPU buffer (and the walk below is
-            // skipped entirely) or is about to be recorded by that same walk.
-            if (StaticBakeIntercept(gfx, subGFX)) {
-                return false;
+            if (gFlipBookTracing) {
+                FlipBookTraceCall(subGFX); // a pose drawn by a plain G_DL, for the trace (sturdy-bassoon#204 C4b)
             }
-#endif
-            // Entering a list the host named for mipmaps (sturdy-bassoon#146): everything it and its
-            // callees load is in scope until the stack drops back below this depth. A baked list that
-            // replays never gets here, and needs nothing: its draws hold the textures it recorded.
-            if (sMipScopeDepth == 0 && !sMipScopeLists.empty() && sMipScopeLists.contains(subGFX)) {
-                sMipScopeDepth = g_exec_stack.cmd_stack.size() + 1;
-            }
-            g_exec_stack.call(*cmd0, subGFX);
+            gfx_call_display_list(gfx, cmd0, subGFX);
         }
     } else {
         (*cmd0) = subGFX;
@@ -5124,6 +5133,18 @@ bool gfx_set_intensity_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G_FLIPBOOK (sturdy-bassoon#204 C4b; gbi.h gSPFlipBook, fast/FlipBook.h): w0's low 16 bits the serial, w1
+// the handle. Calls the pose the clock picks this rendered frame as a pushed G_DL would; a stale handle or a
+// pose with no list draws nothing.
+bool gfx_flipbook_handler_custom(F3DGfx** cmd0) {
+    F3DGfx* cmd = *cmd0;
+    F3DGfx* pose = (F3DGfx*)FlipBookResolve((const void*)cmd->words.w1, (uint16_t)(cmd->words.w0 & 0xFFFF));
+    if (pose != nullptr) {
+        gfx_call_display_list(mInstance.lock().get(), cmd0, pose);
+    }
+    return false;
+}
+
 // G_FOG_WORLD (sturdy-bassoon#167; gbi.h gSPFogWorld): w1 = start << 16 | end, view depths in world units.
 // Enters world-unit fog until the next G_MW_FOG moveword. The band is kept as the factor's own line, so
 // GfxSpVertex and the bake's replay uniforms each compute it with one multiply-add.
@@ -5424,6 +5445,7 @@ static constexpr UcodeHandler otrHandlers = {
     { RDP_G_VTX_WIDE, { "G_VTX_WIDE", gfx_vtx_handler_f3dex2 } },                      // RDP_G_VTX_WIDE (-16)
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
     { OTR_G_FOG_WORLD, { "G_FOG_WORLD", gfx_fog_world_handler_custom } },              // G_FOG_WORLD (0x4b)
+    { OTR_G_FLIPBOOK, { "G_FLIPBOOK", gfx_flipbook_handler_custom } },                 // G_FLIPBOOK (0x4c)
 };
 
 static constexpr UcodeHandler f3dex2Handlers = {
@@ -5843,6 +5865,8 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     PerfCountersFrameScope perfFrame;
 
     SpReset();
+    // Flip heads count rendered frames for their trace (sturdy-bassoon#204 C4b). Not behind the bake guard.
+    FlipBookBeginFrame();
 #ifdef ENABLE_STATIC_BAKE
     // One clock value for the whole frame, so a scrolling texture is at one offset in every draw of
     // it, baked or interpreted (sturdy-bassoon#187 A1).

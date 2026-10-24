@@ -1167,7 +1167,12 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode, uintptr_t w1) {
                                                : "vertices reached through a segment");
     }
     if (!sOpcodeAllowed[op]) {
-        AbortRecording(gfx, "display list used an opcode the recorder does not understand");
+        // A flip head (sturdy-bassoon#204 C4b) picks its pose per rendered frame: recorded, it would freeze
+        // whichever pose was current. Named, so `staticbake list` says which refusal it was.
+        constexpr uint8_t kOpFlipBook = 0x4c; // G_FLIPBOOK
+        const char* why = op == kOpFlipBook ? "a flip head inside a recorded list"
+                                            : "display list used an opcode the recorder does not understand";
+        AbortRecording(gfx, why);
         // Drop whatever object-space geometry is already buffered and hand the rest of the list
         // back to the normal path, correct matrix and all. One frame of this room draws short;
         // from the next frame on it is REJECTED and fully interpreted.
@@ -1177,7 +1182,7 @@ void StaticBakeOnOpcode(Interpreter* gfx, int8_t opcode, uintptr_t w1) {
         memcpy(gfx->mRsp->MP_matrix, sSavedMpMatrix, sizeof(sSavedMpMatrix));
         if (sRecording != nullptr) {
             SPDLOG_WARN("[staticbake] display list {} rejected at opcode {:#04x}", sRecordingKey, (uint8_t)opcode);
-            Reject(*sRecording, "display list used an opcode the recorder does not understand");
+            Reject(*sRecording, why);
             ReleaseGpu(*sRecording);
             sRecording = nullptr;
             sRecordingKey = nullptr;

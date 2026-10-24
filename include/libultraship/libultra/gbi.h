@@ -198,6 +198,7 @@
 #define G_SETTARGETINTERPINDEX 0x46
 #define G_SETTILESIZE_LERP 0x4a
 #define G_FOG_WORLD 0x4b
+#define G_FLIPBOOK 0x4c
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2670,6 +2671,20 @@ typedef union Gfx {
 
 #define gsSPFogWorld(start, end) \
     { (_SHIFTL(G_FOG_WORLD, 24, 8)), (_SHIFTL((start), 16, 16) | _SHIFTL((end), 0, 16)) }
+
+/*
+ * A flip head (sturdy-bassoon#204 C4b; fast/FlipBook.h): written where a G_DL to a flipbook's pose would go.
+ * The interpreter calls, as a pushed G_DL, the pose the clock picks on every rendered frame. `handle` is
+ * the address the flip was registered under (Fast::FlipBookRegister), `serial` the serial that returned.
+ * Only ever written at run time, never into a stored list; the static bake refuses a list holding one.
+ */
+#define gSPFlipBook(pkt, handle, serial)                                      \
+    {                                                                         \
+        Gfx* _g = (Gfx*)(pkt);                                                \
+                                                                              \
+        _g->words.w0 = _SHIFTL(G_FLIPBOOK, 24, 8) | _SHIFTL((serial), 0, 16); \
+        _g->words.w1 = (uintptr_t)(handle);                                   \
+    }
 
 #ifdef F3DEX_GBI_2
 /*
