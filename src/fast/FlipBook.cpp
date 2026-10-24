@@ -34,7 +34,7 @@ struct Trace {
     std::vector<FlipBookTraceRow> rows;
 } sTrace;
 
-bool Reads(const FlipBookDesc& d) {
+bool Valid(const FlipBookDesc& d) {
     if (d.poseCount < 1 || d.poseCount > FLIPBOOK_POSES_MAX) {
         return false;
     }
@@ -50,7 +50,7 @@ bool Loops(const FlipBookDesc& d) {
     return d.frameStep >= 1 && d.frameStep <= d.poseCount;
 }
 
-void Note(const Flip& f, int32_t pose, bool head) {
+void TraceNote(int32_t pose, bool head) {
     if (sTrace.left == 0 || sTrace.lastFrame == sStats.frames) {
         return; // one row a rendered frame
     }
@@ -61,7 +61,7 @@ void Note(const Flip& f, int32_t pose, bool head) {
 } // namespace
 
 uint16_t FlipBookRegister(const void* handle, const FlipBookDesc& desc) {
-    if (handle == nullptr || !Reads(desc)) {
+    if (handle == nullptr || !Valid(desc)) {
         return 0;
     }
     Flip& f = sFlips[handle];
@@ -151,7 +151,6 @@ bool FlipBookGetEntry(const void* handle, FlipBookEntryInfo* out) {
     if (it == sFlips.end()) {
         return false;
     }
-    out->serial = it->second.serial;
     out->last = it->second.last;
     out->resolves = it->second.resolves;
     out->changes = it->second.changes;
@@ -210,8 +209,15 @@ const void* FlipBookResolve(const void* handle, uint16_t serial) {
     f.last = pose;
     f.resolves++;
     sStats.resolves++;
+#if defined(ENABLE_STATIC_BAKE) && !defined(NDEBUG)
+    // The Debug lifetime check (fast/FlipBook.h, LIFETIME).
+    if (f.desc.poses[pose] != nullptr &&
+        StaticBakeGetEntry(f.desc.poses[pose]).state == StaticBakeEntryState::NotRegistered) {
+        sStats.unheld++;
+    }
+#endif
     if (gFlipBookTracing && handle == sTrace.handle) {
-        Note(f, pose, true);
+        TraceNote(pose, true);
     }
     return f.desc.poses[pose];
 }
@@ -224,7 +230,7 @@ void FlipBookTraceCall(const void* displayList) {
     const FlipBookDesc& d = it->second.desc;
     for (int32_t k = 0; k <= d.poseCount; k++) {
         if (d.poses[k] == displayList) {
-            Note(it->second, k, false);
+            TraceNote(k, false);
             return;
         }
     }

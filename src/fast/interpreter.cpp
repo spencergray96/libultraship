@@ -4321,7 +4321,6 @@ bool gfx_modify_vtx_handler_f3dex2(F3DGfx** cmd0) {
     return false;
 }
 
-// F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
 // A pushed call into subGFX: what a G_DL does, and what a flip head does with the pose it picked.
 static void gfx_call_display_list(Interpreter* gfx, F3DGfx** cmd0, F3DGfx* subGFX) {
 #ifdef ENABLE_STATIC_BAKE
@@ -4340,6 +4339,7 @@ static void gfx_call_display_list(Interpreter* gfx, F3DGfx** cmd0, F3DGfx* subGF
     g_exec_stack.call(*cmd0, subGFX);
 }
 
+// F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
 bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;

@@ -34,7 +34,11 @@
 // and the pose list is interpreted.
 //
 // LIFETIME: the registry holds the host's pose pointers, not their resources. The host must unregister a flip
-// before the lists it names can go (ArchiveProps does it in ReleaseHeld, before it drops them).
+// before the lists it names can go (ArchiveProps does it in ReleaseHeld, before it drops them). The Debug
+// check: a resolved pose list the static bake does not know is counted `unheld`. A host's flip poses are
+// lists it registered with the bake when it took hold of them (ArchiveProps does), and the bake forgets
+// them only at StaticBakeReset, just before the host lets them go - so a pose pointer that outlived its
+// resource reads unheld. Release builds skip the lookup.
 
 namespace Fast {
 
@@ -79,11 +83,11 @@ struct FlipBookStats {
     uint64_t changes = 0;  // resolves that picked another pose than the flip's last
     uint64_t stale = 0;    // commands whose handle or serial was not registered: drawn as nothing
     uint64_t frames = 0;   // rendered frames since boot
+    uint64_t unheld = 0;   // Debug only: poses resolved to a list the bake does not know (LIFETIME above)
 };
 FlipBookStats FlipBookGetStats();
 // One flip's: false for an unknown handle.
 struct FlipBookEntryInfo {
-    uint16_t serial = 0;
     int32_t last = -1; // the pose last resolved
     uint64_t resolves = 0;
     uint64_t changes = 0;
