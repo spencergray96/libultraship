@@ -336,9 +336,17 @@ void ConsoleWindow::UpdateElement() {
 }
 
 void ConsoleWindow::DrawElement() {
-    bool inputFocus = false;
+    bool dispatched = false;
     const ImVec2 pos = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
+
+    // Focus the input whenever the console comes back on screen (its menu page selected, the menu
+    // reopened on that page, the popout opened), so typing can start without a click
+    const int frame = ImGui::GetFrameCount();
+    if (frame != mLastDrawnFrame + 1) {
+        mFocusInput = true;
+    }
+    mLastDrawnFrame = frame;
 
     // Renders autocomplete window
     if (mOpenAutocomplete) {
@@ -362,7 +370,7 @@ void ConsoleWindow::DrawElement() {
                     memset(mInputBuffer, 0, gMaxBufferSize);
                     memcpy(mInputBuffer, autoComplete.c_str(), sizeof(char) * autoComplete.size());
                     mOpenAutocomplete = false;
-                    inputFocus = true;
+                    mFocusInput = true;
                 }
             }
             ImGui::EndTable();
@@ -500,22 +508,29 @@ void ConsoleWindow::DrawElement() {
                                               ImGuiInputTextFlags_CallbackHistory;
         ImGui::PushItemWidth(-53.0f);
 
-        float yBeforeInput = ImGui::GetCursorPosY();
+        if (mFocusInput) {
+            ImGui::SetKeyboardFocusHere();
+            mFocusInput = false;
+        }
 
         if (ImGui::InputTextWithHint("##CMDInput", ">", mInputBuffer, gMaxBufferSize, flags,
                                      &ConsoleWindow::CallbackStub, this)) {
-            inputFocus = true;
+            dispatched = true;
             if (mInputBuffer[0] != '\0' && mInputBuffer[0] != ' ') {
                 Dispatch(std::string(mInputBuffer));
             }
             memset(mInputBuffer, 0, gMaxBufferSize);
+            // Enter deactivates the input; take focus straight back for the next command
+            ImGui::SetKeyboardFocusHere(-1);
         }
 
         if (mCmdHint != "None") {
             if (ImGui::IsItemFocused()) {
-                // Place the tooltip above the console input field
-                ImGui::SetNextWindowPos(ImVec2(pos.x, pos.y + size.y - ((size.y - yBeforeInput) * 2)));
-                ImGui::SameLine();
+                // Anchor the tooltip by its bottom edge just above the input, so a hint of any
+                // number of lines ends above the line being typed instead of growing down over it
+                const ImVec2 inputMin = ImGui::GetItemRectMin();
+                ImGui::SetNextWindowPos(ImVec2(inputMin.x, inputMin.y - ImGui::GetStyle().ItemSpacing.y),
+                                        ImGuiCond_Always, ImVec2(0.0f, 1.0f));
                 ImGui::BeginTooltip();
                 ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
                 ImGui::TextUnformatted(mCmdHint.c_str());
@@ -527,15 +542,15 @@ void ConsoleWindow::DrawElement() {
         ImGui::SameLine();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 50);
 
-        if (ImGui::Button("Submit") && !inputFocus && mInputBuffer[0] != '\0' && mInputBuffer[0] != ' ') {
-            Dispatch(std::string(mInputBuffer));
-            memset(mInputBuffer, 0, gMaxBufferSize);
+        if (ImGui::Button("Submit")) {
+            if (!dispatched && mInputBuffer[0] != '\0' && mInputBuffer[0] != ' ') {
+                Dispatch(std::string(mInputBuffer));
+                memset(mInputBuffer, 0, gMaxBufferSize);
+            }
+            mFocusInput = true;
         }
 
         ImGui::SetItemDefaultFocus();
-        if (inputFocus) {
-            ImGui::SetKeyboardFocusHere(-1);
-        }
         ImGui::PopItemWidth();
     }
 }

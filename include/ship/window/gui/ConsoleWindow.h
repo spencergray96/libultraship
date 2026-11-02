@@ -142,6 +142,10 @@ class ConsoleWindow : public GuiWindow {
     std::string mFilter;
     std::string mCurrentChannel = "Console";
     bool mOpenAutocomplete = false;
+    // Put the caret in the command input the next time it is drawn
+    bool mFocusInput = false;
+    // ImGui frame this console was last drawn on, to tell when it comes back on screen
+    int mLastDrawnFrame = -1;
     char* mInputBuffer = nullptr;
     char* mFilterBuffer = nullptr;
     std::string mCmdHint = "None";
