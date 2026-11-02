@@ -532,7 +532,7 @@ void ConsoleWindow::DrawElement() {
                 ImGui::SetNextWindowPos(ImVec2(inputMin.x, inputMin.y - ImGui::GetStyle().ItemSpacing.y),
                                         ImGuiCond_Always, ImVec2(0.0f, 1.0f));
                 ImGui::BeginTooltip();
-                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * (mCmdHintLaidOut ? 90.0f : 35.0f));
                 ImGui::TextUnformatted(mCmdHint.c_str());
                 ImGui::PopTextWrapPos();
                 ImGui::EndTooltip();
@@ -644,6 +644,10 @@ int ConsoleWindow::CallbackStub(ImGuiInputTextCallbackData* data) {
             break;
         default:
             instance->mOpenAutocomplete = false;
+            instance->mCmdHintLaidOut = instance->CustomCommandHint(std::string(data->Buf), &instance->mCmdHint);
+            if (instance->mCmdHintLaidOut) {
+                break;
+            }
             for (auto& [cmd, entry] : console->GetCommands()) {
                 const std::vector<std::string> cmdArgs = StringHelper::Split(std::string(data->Buf), " ");
                 if (data->BufTextLen > 2 && !cmdArgs.empty() && cmd.find(cmdArgs[0]) != std::string::npos) {

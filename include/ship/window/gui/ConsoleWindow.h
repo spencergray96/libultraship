@@ -111,6 +111,16 @@ class ConsoleWindow : public GuiWindow {
     /** @brief Processes key bindings and clears expired auto-complete state. */
     void UpdateElement() override;
 
+    /**
+     * @brief Lets a subclass supply its own hint for the text typed so far, in place of the command's usage line.
+     * @param input What is in the input field.
+     * @param hint  Set to the hint, already laid out line by line; it is drawn without wrapping to the usual width.
+     * @return true when @p hint was set; false keeps the default usage line.
+     */
+    virtual bool CustomCommandHint(const std::string& input, std::string* hint) {
+        return false;
+    }
+
   private:
     /** @brief An individual log entry stored in a channel's history. */
     struct ConsoleLine {
@@ -149,6 +159,8 @@ class ConsoleWindow : public GuiWindow {
     char* mInputBuffer = nullptr;
     char* mFilterBuffer = nullptr;
     std::string mCmdHint = "None";
+    // mCmdHint came from CustomCommandHint, so it carries its own line breaks
+    bool mCmdHintLaidOut = false;
     spdlog::level::level_enum mLevelFilter = spdlog::level::trace;
     std::map<ImGuiKey, std::string> mBindings;
     std::map<ImGuiKey, std::string> mBindingToggle;
