@@ -344,6 +344,7 @@ struct RDP {
     uint64_t combine_mode;
     bool grayscale;
     uint8_t fade; // how far a gSPFade has faded what is drawn, 0 (none, the zeroed default) to 255 (sturdy-bassoon#284)
+    bool fade_depth; // its depth-only pass (G_FADE_DEPTH)
 
     uint8_t prim_lod_fraction;
     uint16_t prim_depth;

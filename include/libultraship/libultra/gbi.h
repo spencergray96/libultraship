@@ -200,6 +200,7 @@
 #define G_FOG_WORLD 0x4b
 #define G_FLIPBOOK 0x4c
 #define G_FADE 0x4d
+#define G_FADE_DEPTH 0x100 /* gSPFade's depth-only pass: see below */
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2681,16 +2682,18 @@ typedef union Gfx {
  */
 /*
  * A fade (sturdy-bassoon#284; Interpreter::GfxSpTri1): `amount` 0 (none) to 255 (gone). While it is above 0, a
- * combiner alpha that is the constant 1 reads 255 - amount instead, and each pixel is kept whole or discarded against
- * noise, so a model dissolves rather than turning translucent: what is kept still writes depth, so nothing needs
- * sorting. Only a material whose alpha is the constant 1 fades. It holds until the next gSPFade or the frame's end.
+ * combiner alpha that is the constant 1 reads 255 - amount instead, and the model is blended at that opacity. Only a
+ * material whose alpha is the constant 1 fades. It holds until the next gSPFade or the frame's end.
+ * Draw the model twice so a faded model shows only its front surface, not its insides through itself: first with
+ * `amount | G_FADE_DEPTH`, which writes its depth and no colour, then with `amount`, which blends where its depth
+ * matches (the decal compare) and writes no depth.
  */
-#define gSPFade(pkt, amount)                       \
-    {                                              \
-        Gfx* _g = (Gfx*)(pkt);                     \
-                                                   \
-        _g->words.w0 = _SHIFTL(G_FADE, 24, 8);     \
-        _g->words.w1 = (uintptr_t)((amount)&0xFF); \
+#define gSPFade(pkt, amount)                        \
+    {                                               \
+        Gfx* _g = (Gfx*)(pkt);                      \
+                                                    \
+        _g->words.w0 = _SHIFTL(G_FADE, 24, 8);      \
+        _g->words.w1 = (uintptr_t)((amount)&0x1FF); \
     }
 
 #define gSPFlipBook(pkt, handle, serial)                                      \

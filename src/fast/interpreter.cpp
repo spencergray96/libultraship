@@ -2322,6 +2322,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool prim_depth_enabled = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
     bool depth_test = (zbuffer_enabled || prim_depth_enabled) && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    // A fade (sturdy-bassoon#284; gbi.h gSPFade): its depth pass writes depth as the material says; its colour pass
+    // writes none, and blends only where its depth matches the depth pass's (the decal compare below).
+    const bool fade = mRdp->fade != 0;
+    const bool fade_depth = fade && mRdp->fade_depth;
+    if (fade && !fade_depth) {
+        depth_mask = false;
+    }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
@@ -2329,7 +2336,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
     }
 
-    bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+    bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC || (fade && !fade_depth);
     if (zmode_decal != mRenderingState.decal_mode) {
         Flush();
         mRapi->SetZmodeDecal(zmode_decal);
@@ -2367,15 +2374,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
-    // A fade (sturdy-bassoon#284; gbi.h gSPFade): the noise compare keeps or discards each pixel by its alpha, and
-    // FadeCombine below gives a constant-1 alpha the fade's instead. The material's own depth write stands, so the
-    // pixels kept stay sorted like any opaque ones.
-    const bool fade = mRdp->fade != 0;
+    // A fade (gbi.h gSPFade): blended, its alpha FadeCombine's (below); its depth pass drawn invisible, alpha 0.
     if (fade) {
         use_alpha = true;
-        use_noise = true;
-        alpha_threshold = true;
+        use_noise = false;
+        alpha_threshold = false;
         texture_edge = false;
+        invisible = fade_depth;
     }
 
     if (texture_edge) {
@@ -5179,12 +5184,14 @@ bool gfx_flipbook_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
-// G_FADE (sturdy-bassoon#284; gbi.h gSPFade): w1's low byte, how far what follows is faded. GfxSpTri1 applies it.
+// G_FADE (sturdy-bassoon#284; gbi.h gSPFade): w1's low byte, how far what follows is faded, and G_FADE_DEPTH for the
+// depth-only pass. GfxSpTri1 applies it.
 bool gfx_fade_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->fade = (uint8_t)(cmd->words.w1 & 0xFF);
+    gfx->mRdp->fade_depth = (cmd->words.w1 & OTR_G_FADE_DEPTH) != 0;
     return false;
 }
 
@@ -5910,6 +5917,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
     SpReset();
     mRdp->fade = 0; // a list that set a fade and never cleared it ends it with the frame (sturdy-bassoon#284)
+    mRdp->fade_depth = false;
     // Flip heads count rendered frames for their trace (sturdy-bassoon#204 C4b). Not behind the bake guard.
     FlipBookBeginFrame();
 #ifdef ENABLE_STATIC_BAKE
