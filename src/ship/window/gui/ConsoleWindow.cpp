@@ -344,9 +344,14 @@ void ConsoleWindow::DrawElement() {
     // reopened on that page, the popout opened), so typing can start without a click
     const int frame = ImGui::GetFrameCount();
     if (frame != mLastDrawnFrame + 1) {
-        mFocusInput = true;
+        mHoldFocus = true;
     }
     mLastDrawnFrame = frame;
+    // Until the user clicks or types, anything that takes the focus away (the menu opening at launch
+    // loses it a moment later) gives it back; after that the console never fights the user for it
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        mHoldFocus = false;
+    }
 
     // Renders autocomplete window
     if (mOpenAutocomplete) {
@@ -508,13 +513,16 @@ void ConsoleWindow::DrawElement() {
                                               ImGuiInputTextFlags_CallbackHistory;
         ImGui::PushItemWidth(-53.0f);
 
-        if (mFocusInput) {
+        if (mFocusInput || (mHoldFocus && !mInputActive)) {
             ImGui::SetKeyboardFocusHere();
             mFocusInput = false;
         }
 
-        if (ImGui::InputTextWithHint("##CMDInput", ">", mInputBuffer, gMaxBufferSize, flags,
-                                     &ConsoleWindow::CallbackStub, this)) {
+        const bool entered = ImGui::InputTextWithHint("##CMDInput", ">", mInputBuffer, gMaxBufferSize, flags,
+                                                      &ConsoleWindow::CallbackStub, this);
+        mInputActive = ImGui::IsItemActive();
+        if (entered) {
+            mHoldFocus = false;
             dispatched = true;
             if (mInputBuffer[0] != '\0' && mInputBuffer[0] != ' ') {
                 Dispatch(std::string(mInputBuffer));
@@ -590,6 +598,8 @@ void ConsoleWindow::Dispatch(const std::string& line) {
 
 int ConsoleWindow::CallbackStub(ImGuiInputTextCallbackData* data) {
     const auto instance = static_cast<ConsoleWindow*>(data->UserData);
+    // A keystroke in the input: the user has it, so stop holding the focus for them
+    instance->mHoldFocus = false;
     const bool emptyHistory = instance->mHistory.empty();
     auto console = Context::GetRawInstance()->GetConsole();
     std::string history;

@@ -154,6 +154,10 @@ class ConsoleWindow : public GuiWindow {
     bool mOpenAutocomplete = false;
     // Put the caret in the command input the next time it is drawn
     bool mFocusInput = false;
+    // Keep putting the caret back in the input, from when the console is shown until the user clicks or types
+    bool mHoldFocus = false;
+    // The input had the keyboard last frame
+    bool mInputActive = false;
     // ImGui frame this console was last drawn on, to tell when it comes back on screen
     int mLastDrawnFrame = -1;
     char* mInputBuffer = nullptr;
