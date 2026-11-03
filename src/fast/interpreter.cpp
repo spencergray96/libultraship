@@ -2235,6 +2235,24 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
+// The combine mode under a fade (sturdy-bassoon#284): each cycle's alpha that is the constant 1 - (a - b) * c + 1 with a
+// and b alike, or with c 0 - reads the environment's alpha instead, which the vertex inputs give as 255 - fade. Any
+// other alpha is left as it is, so only such a material fades.
+static uint64_t FadeCombine(uint64_t combine) {
+    for (const uint32_t shift : { 16u, 44u }) {
+        const uint32_t alpha = (uint32_t)(combine >> shift) & 0xFFF;
+        const uint32_t a = alpha & 7;
+        const uint32_t b = (alpha >> 3) & 7;
+        const uint32_t c = (alpha >> 6) & 7;
+        const uint32_t d = (alpha >> 9) & 7;
+        if ((a == b || c == G_ACMUX_0) && d == G_ACMUX_1) {
+            combine &= ~((uint64_t)7 << (shift + 9));
+            combine |= (uint64_t)G_ACMUX_ENVIRONMENT << (shift + 9);
+        }
+    }
+    return combine;
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
@@ -2349,6 +2367,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
+    // A fade (sturdy-bassoon#284; gbi.h gSPFade): the noise compare keeps or discards each pixel by its alpha, and
+    // FadeCombine below gives a constant-1 alpha the fade's instead. The material's own depth write stands, so the
+    // pixels kept stay sorted like any opaque ones.
+    const bool fade = mRdp->fade != 0;
+    if (fade) {
+        use_alpha = true;
+        use_noise = true;
+        alpha_threshold = true;
+        texture_edge = false;
+    }
 
     if (texture_edge) {
         if (use_alpha) {
@@ -2414,7 +2442,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     ColorCombinerKey key;
-    key.combine_mode = mRdp->combine_mode;
+    key.combine_mode = fade ? FadeCombine(mRdp->combine_mode) : mRdp->combine_mode;
     key.options = cc_options;
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
@@ -2761,6 +2789,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                     case G_CCMUX_ENVIRONMENT:
                         color = &mRdp->env_color;
+                        if (fade && k == 1) {
+                            // FadeCombine's environment: the fade's alpha, the colour's own channels untouched.
+                            tmp = mRdp->env_color;
+                            tmp.a = 255 - mRdp->fade;
+                            color = &tmp;
+                        }
                         break;
                     case G_CCMUX_PRIMITIVE_ALPHA: {
                         tmp.r = tmp.g = tmp.b = mRdp->prim_color.a;
@@ -5145,6 +5179,15 @@ bool gfx_flipbook_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G_FADE (sturdy-bassoon#284; gbi.h gSPFade): w1's low byte, how far what follows is faded. GfxSpTri1 applies it.
+bool gfx_fade_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->mRdp->fade = (uint8_t)(cmd->words.w1 & 0xFF);
+    return false;
+}
+
 // G_FOG_WORLD (sturdy-bassoon#167; gbi.h gSPFogWorld): w1 = start << 16 | end, view depths in world units.
 // Enters world-unit fog until the next G_MW_FOG moveword. The band is kept as the factor's own line, so
 // GfxSpVertex and the bake's replay uniforms each compute it with one multiply-add.
@@ -5446,6 +5489,7 @@ static constexpr UcodeHandler otrHandlers = {
     { RDP_G_TRI1_WIDE, { "G_TRI1_WIDE", gfx_tri1_handler_f3dex2 } },                   // RDP_G_TRI1_WIDE (-17)
     { OTR_G_FOG_WORLD, { "G_FOG_WORLD", gfx_fog_world_handler_custom } },              // G_FOG_WORLD (0x4b)
     { OTR_G_FLIPBOOK, { "G_FLIPBOOK", gfx_flipbook_handler_custom } },                 // G_FLIPBOOK (0x4c)
+    { OTR_G_FADE, { "G_FADE", gfx_fade_handler_custom } },                             // G_FADE (0x4d)
 };
 
 static constexpr UcodeHandler f3dex2Handlers = {
@@ -5865,6 +5909,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     PerfCountersFrameScope perfFrame;
 
     SpReset();
+    mRdp->fade = 0; // a list that set a fade and never cleared it ends it with the frame (sturdy-bassoon#284)
     // Flip heads count rendered frames for their trace (sturdy-bassoon#204 C4b). Not behind the bake guard.
     FlipBookBeginFrame();
 #ifdef ENABLE_STATIC_BAKE

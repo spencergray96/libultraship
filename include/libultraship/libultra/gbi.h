@@ -199,6 +199,7 @@
 #define G_SETTILESIZE_LERP 0x4a
 #define G_FOG_WORLD 0x4b
 #define G_FLIPBOOK 0x4c
+#define G_FADE 0x4d
 
 /*
  * The following commands are the "generated" RDP commands; the user
@@ -2678,6 +2679,20 @@ typedef union Gfx {
  * the address the flip was registered under (Fast::FlipBookRegister), `serial` the serial that returned.
  * Only ever written at run time, never into a stored list; the static bake refuses a list holding one.
  */
+/*
+ * A fade (sturdy-bassoon#284; Interpreter::GfxSpTri1): `amount` 0 (none) to 255 (gone). While it is above 0, a
+ * combiner alpha that is the constant 1 reads 255 - amount instead, and each pixel is kept whole or discarded against
+ * noise, so a model dissolves rather than turning translucent: what is kept still writes depth, so nothing needs
+ * sorting. Only a material whose alpha is the constant 1 fades. It holds until the next gSPFade or the frame's end.
+ */
+#define gSPFade(pkt, amount)                       \
+    {                                              \
+        Gfx* _g = (Gfx*)(pkt);                     \
+                                                   \
+        _g->words.w0 = _SHIFTL(G_FADE, 24, 8);     \
+        _g->words.w1 = (uintptr_t)((amount)&0xFF); \
+    }
+
 #define gSPFlipBook(pkt, handle, serial)                                      \
     {                                                                         \
         Gfx* _g = (Gfx*)(pkt);                                                \
